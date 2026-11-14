@@ -45,6 +45,10 @@ class SubtaskWorker:
             return f'python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py "{clean_url}"'
         return cmd
 
+    @staticmethod
+    def _is_placeholder_command(cmd: str) -> bool:
+        return bool(re.search(r'web_search\.py\s+["\']запрос["\']', cmd.lower()))
+
     async def execute(self, job: SubtaskJob, context_hint: str) -> Dict[str, Any]:
         async with self.semaphore:
             self._check_cancelled()
@@ -52,12 +56,12 @@ class SubtaskWorker:
 
             tool_instruction = (
                 "У тебя есть доступ к bash-песочнице Linux и готовым Python-инструментам:\n"
-                "- Поиск ссылок в интернете: python3 /home/sid/RAID/_AI/universal_agent/skills/web_search.py \"запрос\" --limit 5\n"
-                "- Парсинг одной страницы (BeautifulSoup): python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"https://реальный_url\"\n\n"
+                "- Поиск ссылок в интернете: python3 /home/sid/RAID/_AI/universal_agent/skills/web_search.py \"<ключевые_слова_по_задаче>\" --limit 5\n"
+                "- Парсинг одной страницы (BeautifulSoup): python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"<реальный_https_url>\"\n\n"
                 "УНИВЕРСАЛЬНЫЕ ПРАВИЛА:\n"
                 "1. Если в блоке 'УЖЕ НАЙДЕННЫЕ В ЭТОЙ СЕССИИ URL' есть релевантный сайт — парси его или его внутренние разделы через web_parser.py.\n"
                 "2. Если в контексте есть 'ВЫЧЕРКНУТЫЕ НЕРЕЛЕВАНТНЫЕ ДОМЕНЫ' — категорически запрещено обращаться к ним снова!\n"
-                "3. Никогда не пиши в <bash> голый URL без команды.\n"
+                "3. Никогда не пиши в <bash> голый URL без команды и не копируй шаблонные слова вроде 'запрос'.\n"
                 "4. Для запуска команды выведи строго <bash>команда</bash> без лишнего текста."
             )
 
@@ -84,7 +88,9 @@ class SubtaskWorker:
                 cmd = self._normalize_command(bash_match.group(1))
                 blocked_hit = self.blackboard.find_blocked_domain_in_command(cmd)
 
-                if blocked_hit:
+                if self._is_placeholder_command(cmd):
+                    shell_out = "[-] Ошибка: Передано шаблонное слово 'запрос'. Укажи реальные ключевые слова по задаче."
+                elif blocked_hit:
                     shell_out = f"[-] Ошибка: Домен '{blocked_hit}' вычеркнут как нерелевантный. Используй другой источник."
                 else:
                     print(f"  [Shell #{job.subtask_id}:{job.role_name}] Шаг {step}: {cmd[:95]}...")
