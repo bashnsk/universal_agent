@@ -1,0 +1,180 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <title>Universal AI Agent WebUI</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 20px; }
+        .main-layout { display: flex; gap: 20px; max-width: 1400px; margin: 0 auto; }
+        .sidebar { width: 320px; background: #1e293b; padding: 20px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); height: 800px; overflow-y: auto; display: flex; flex-direction: column; gap: 20px; }
+        .content { flex-grow: 1; background: #1e293b; padding: 30px; border-radius: 12px; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+        h1, h3 { color: #38bdf8; margin-top: 0; }
+        textarea { width: 100%; height: 90px; background: #0f172a; color: #fff; border: 1px solid #475569; border-radius: 8px; padding: 12px; font-size: 15px; resize: vertical; box-sizing: border-box; }
+        input, select { width: 100%; background: #0f172a; color: #fff; border: 1px solid #475569; border-radius: 6px; padding: 8px; margin-top: 5px; margin-bottom: 12px; box-sizing: border-box; }
+        .btn-group { display: flex; gap: 10px; margin-top: 10px; }
+        button { background: #0284c7; color: white; border: none; padding: 12px 24px; font-size: 16px; border-radius: 8px; cursor: pointer; font-weight: bold; transition: background 0.2s; width: 100%; }
+        button:hover { background: #0ea5e9; }
+        button:disabled { background: #475569; cursor: not-allowed; }
+        .btn-stop { background: #dc2626 !important; }
+        .btn-stop:hover { background: #ef4444 !important; }
+        .btn-stop:disabled { background: #475569 !important; }
+        pre { background: #0f172a; padding: 15px; border-radius: 8px; border: 1px solid #334155; height: 380px; overflow-y: auto; font-family: "Fira Code", monospace; font-size: 13px; color: #38bdf8; }
+        .task-item { background: #0f172a; padding: 10px; margin-bottom: 8px; border-radius: 6px; cursor: pointer; border: 1px solid #334155; font-size: 13px; transition: border 0.2s; }
+        .task-item:hover { border-color: #38bdf8; }
+        .config-section { border-top: 1px solid #334155; padding-top: 15px; }
+        label { font-size: 13px; color: #94a3b8; }
+    </style>
+</head>
+<body>
+    <div class="main-layout">
+        <div class="sidebar">
+            <div>
+                <h3>⚙️ Конфигурация</h3>
+                <div class="config-section">
+                    <label>Модель агента (Default):</label>
+                    <input type="text" id="cfgDefaultModel">
+                    
+                    <label>Модель критика (Critic):</label>
+                    <input type="text" id="cfgCriticModel">
+                    
+                    <label>Макс. итераций:</label>
+                    <input type="number" id="cfgMaxIter">
+                    
+                    <label>Число ролей (параллельно):</label>
+                    <input type="number" id="cfgMultiRole">
+                    
+                    <button onclick="saveConfig()" style="background: #0d9488; font-size: 14px; padding: 8px;">Сохранить конфиг</button>
+                </div>
+            </div>
+
+            <div style="flex-grow: 1; overflow-y: auto;">
+                <h3>📁 История задач</h3>
+                <div id="historyList">Загрузка...</div>
+            </div>
+        </div>
+
+        <div class="content">
+            <h1>Universal Multi-Agent System</h1>
+            <p>Введите сложную задачу для параллельной декомпозиции и мультиролевого анализа:</p>
+            <textarea id="taskInput" placeholder="Например: Разработать микросервис на FastAPI..."></textarea>
+            <br>
+            <div class="btn-group">
+                <button id="submitBtn" onclick="startTask()">Запустить задачу</button>
+                <button id="stopBtn" class="btn-stop" onclick="stopTask()" disabled>Остановить</button>
+            </div>
+            
+            <h3>Лог выполнения в реальном времени (SSE):</h3>
+            <pre id="logOutput">Ожидание задачи...</pre>
+        </div>
+    </div>
+
+    <script>
+        let eventSource = null;
+
+        async function loadConfig() {
+            const res = await fetch('/api/config');
+            const cfg = await res.json();
+            document.getElementById("cfgDefaultModel").value = cfg.ollama.default_model;
+            document.getElementById("cfgCriticModel").value = cfg.ollama.critic_model;
+            document.getElementById("cfgMaxIter").value = cfg.execution.max_iterations;
+            document.getElementById("cfgMultiRole").value = cfg.execution.multi_role_count;
+        }
+
+        async function saveConfig() {
+            const data = {
+                default_model: document.getElementById("cfgDefaultModel").value,
+                critic_model: document.getElementById("cfgCriticModel").value,
+                max_iterations: parseInt(document.getElementById("cfgMaxIter").value),
+                multi_role_count: parseInt(document.getElementById("cfgMultiRole").value)
+            };
+            const res = await fetch('/api/config', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(data)
+            });
+            const result = await res.json();
+            alert(result.status === "success" ? "Конфигурация успешно обновлена!" : "Ошибка сохранения");
+        }
+
+        async function loadHistory() {
+            const res = await fetch('/api/tasks');
+            const tasks = await res.json();
+            const listEl = document.getElementById("historyList");
+            if (tasks.length === 0) {
+                listEl.innerHTML = "<p style='color: #64748b; font-size: 13px;'>Нет сохраненных задач</p>";
+                return;
+            }
+            listEl.innerHTML = tasks.map(t => `
+                <div class="task-item" onclick="loadTaskResult('${t}')">
+                    📁 ${t.replace('task_', '').replace('.md', '')}
+                </div>
+            `).join('');
+        }
+
+        async function loadTaskResult(filename) {
+            if (eventSource) eventSource.close();
+            const res = await fetch(`/api/task/${filename}`);
+            const data = await res.json();
+            document.getElementById("logOutput").innerText = data.content;
+            document.getElementById("submitBtn").disabled = false;
+            document.getElementById("stopBtn").disabled = true;
+        }
+
+        async function startTask() {
+            const task = document.getElementById("taskInput").value;
+            if (!task) return alert("Введите задачу!");
+            
+            document.getElementById("submitBtn").disabled = true;
+            document.getElementById("stopBtn").disabled = false;
+            document.getElementById("logOutput").innerText = "Инициализация стрима...";
+
+            const res = await fetch('/api/run', {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify({ task: task })
+            });
+            const data = await res.json();
+            if (data.status === "already_running") {
+                alert("Задача уже выполняется!");
+                document.getElementById("submitBtn").disabled = false;
+                document.getElementById("stopBtn").disabled = true;
+                return;
+            }
+
+            if (eventSource) eventSource.close();
+
+            eventSource = new EventSource('/api/stream-logs');
+            
+            eventSource.onmessage = function(event) {
+                const logData = JSON.parse(event.data);
+                const logEl = document.getElementById("logOutput");
+                logEl.innerText = logData.log;
+                logEl.scrollTop = logEl.scrollHeight;
+
+                if (!logData.running) {
+                    eventSource.close();
+                    document.getElementById("submitBtn").disabled = false;
+                    document.getElementById("stopBtn").disabled = true;
+                    loadHistory();
+                }
+            };
+
+            eventSource.onerror = function(err) {
+                console.error("SSE Error:", err);
+                eventSource.close();
+                document.getElementById("submitBtn").disabled = false;
+                document.getElementById("stopBtn").disabled = true;
+                loadHistory();
+            };
+        }
+
+        async function stopTask() {
+            await fetch('/api/stop', { method: 'POST' });
+            document.getElementById("stopBtn").disabled = true;
+        }
+
+        loadConfig();
+        loadHistory();
+    </script>
+</body>
+</html>

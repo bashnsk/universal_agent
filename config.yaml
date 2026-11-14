@@ -1,0 +1,9 @@
+execution:
+  max_iterations: 10
+  max_subtask_retries: 3
+  multi_role_count: 3
+ollama:
+  base_url: http://localhost:11434
+  critic_model: deepseek-r1:8b
+  default_model: qwen3.5:9b
+  timeout: 120
