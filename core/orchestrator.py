@@ -26,8 +26,10 @@ class BatchOrchestrator:
         self.cfg = config
         self._cancelled = False
         self._active_tasks: List[asyncio.Task] = []
-        self.executed_commands: List[str] = []
-        self.all_attempted_commands: List[str] = []
+
+        # Оперативная память текущей сессии (очищается после завершения задачи)
+        self.session_working_commands: List[str] = []
+        self.session_failed_attempts: List[str] = []
 
         ollama_cfg = config.get("ollama", {})
         exec_cfg = config.get("execution", {})
@@ -63,17 +65,17 @@ class BatchOrchestrator:
             {
                 "name": "Senior_Developer",
                 "temperature": 0.2,
-                "system_prompt": "Ты ведущий разработчик. Пиши рабочий код, парсеры и команды, извлекающие реальные данные без заглушек.",
+                "system_prompt": "Ты ведущий разработчик. Пиши рабочий код, парсеры и скрипты, извлекающие реальные данные без заглушек.",
             },
             {
                 "name": "System_Architect",
                 "temperature": 0.3,
-                "system_prompt": "Ты системный архитектор и исследователь. Если один источник или метод не работает, находишь альтернативный рабочий источник.",
+                "system_prompt": "Ты системный архитектор и исследователь. Находишь реальные источники данных и рабочие инструменты вместо угадывания.",
             },
             {
                 "name": "EdgeCase_Tester",
                 "temperature": 0.4,
-                "system_prompt": "Ты инженер верификации данных. Проверяешь достоверность каждого факта через инструменты и отсекаешь догадки.",
+                "system_prompt": "Ты инженер верификации. Проверяешь фактический вывод команд и отбрасываешь пустые или ошибочные ответы.",
             },
         ]
         all_roles = exec_cfg.get("roles", default_roles)
@@ -132,26 +134,44 @@ class BatchOrchestrator:
         if self._cancelled:
             raise asyncio.CancelledError("Задача отменена пользователем.")
 
+    def _record_session_failure(self, cmd: str, reason: str) -> None:
+        short_cmd = cmd.strip().replace("\n", " ")[:120]
+        short_reason = reason.strip().replace("\n", " ")[:140]
+        entry = f"Команда `{short_cmd}` -> ОШИБКА: {short_reason}"
+        if entry not in self.session_failed_attempts:
+            self.session_failed_attempts.append(entry)
+
+    def _is_command_output_useful(self, shell_out: str) -> tuple[bool, str]:
+        if "[EXIT CODE]: 0" not in shell_out:
+            return False, "ненулевой код возврата или ошибка выполнения"
+        if "[STDOUT]:" not in shell_out:
+            return False, "пустой вывод (нет данных)"
+        stdout_part = shell_out.split("[STDOUT]:", 1)[1].strip()
+        if len(stdout_part) < 15:
+            return False, "слишком короткий или пустой ответ"
+        return True, ""
+
     async def _run_single_job(self, job: SubtaskJob, context_hint: str) -> Dict[str, Any]:
         async with self.semaphore:
             self._check_cancelled()
             print(f"[Queue -> GPU] Подзадача #{job.subtask_id} | Роль: {job.role_name}")
 
             tool_instruction = (
-                "У тебя есть доступ к bash-песочнице Linux (curl, python3, стандартные утилиты).\n"
+                "У тебя есть доступ к bash-песочнице Linux (curl, python3, системные утилиты).\n"
                 "УНИВЕРСАЛЬНЫЕ ПРАВИЛА ПОИСКА РЕШЕНИЙ:\n"
-                "1. Запрещено выдумывать несуществующие URL, API-эндпоинты и данные.\n"
-                "2. Запрещено перекладывать задачу на пользователя (не пиши 'зарегистрируйтесь и получите ключ' или 'проверьте сами').\n"
-                "3. Если выбранный источник или метод вернул ошибку или пустоту — немедленно меняй стратегию в следующем <bash>...</bash>: "
-                "ищи открытые веб-страницы, парси HTML/RSS через python3, проверяй альтернативные источники и зеркала.\n"
-                "4. Если в контексте указаны АНТИ-ПАТТЕРНЫ (тупиковые пути) — категорически запрещено их повторять.\n"
-                "5. Для запуска команды выведи строго <bash>команда</bash> без лишнего текста. "
-                "Когда реальные факты получены — дай точный, структурированный ответ."
+                "1. Строго держись сути исходной задачи пользователя. Не уходи в посторонние темы.\n"
+                "2. Запрещено выдумывать несуществующие URL, API и данные. Если нужен веб-источник или файл — "
+                "сначала найди реальный рабочий адрес/путь через поиск или проверку HTML, затем извлеки данные.\n"
+                "3. ВНИМАТЕЛЬНО изучи блок 'НЕУДАЧНЫЕ ПОПЫТКИ ТЕКУЩЕЙ ЗАДАЧИ' в контексте: "
+                "категорически запрещено повторять команды, домены и методы, которые уже дали ошибку!\n"
+                "4. Запрещено перекладывать задачу на пользователя (не пиши 'сделайте сами' или 'получите ключ').\n"
+                "5. Для вызова команды выведи строго <bash>команда</bash> без пояснений. "
+                "Когда реальные факты получены — дай чёткий итоговый ответ."
             )
 
             prompt = (
                 f"{tool_instruction}\n\n"
-                f"Контекст из памяти, тупиковых путей и прошлых итераций:\n{context_hint}\n\n"
+                f"{context_hint}\n\n"
                 f"Твоя подзадача:\n{job.description}"
             )
 
@@ -170,18 +190,22 @@ class BatchOrchestrator:
 
                 self._check_cancelled()
                 cmd = bash_match.group(1).strip()
-                self.all_attempted_commands.append(cmd)
                 print(f"  [Shell #{job.subtask_id}:{job.role_name}] Шаг {step}: {cmd[:90]}...")
                 shell_out = await ShellTool.run(cmd, workspace_dir=str(self.workspace_dir))
-                if "[EXIT CODE]: 0" in shell_out and "[STDOUT]:" in shell_out:
-                    self.executed_commands.append(cmd)
+
+                is_ok, fail_reason = self._is_command_output_useful(shell_out)
+                if is_ok:
+                    if cmd not in self.session_working_commands:
+                        self.session_working_commands.append(cmd)
+                else:
+                    self._record_session_failure(cmd, fail_reason)
 
                 followup_prompt = (
                     f"Выполнена команда:\n{cmd}\n\n"
                     f"Вывод песочницы:\n{shell_out}\n\n"
-                    f"Оцени результат: если реальные фактические данные ещё не добыты или возникла ошибка, "
-                    f"попробуй принципиально другой подход через <bash>...</bash>. "
-                    f"Если факты получены — сформируй итоговый ответ по подзадаче: {job.description}"
+                    f"Оцени результат: если команда вернула ошибку, пустоту или не дала нужных фактов, "
+                    f"НЕ повторяй её — придумай принципиально другой способ через <bash>...</bash>. "
+                    f"Если факты получены — дай точный итоговый ответ по подзадаче: {job.description}"
                 )
                 response = await self.client.generate(
                     model=self.executor_model,
@@ -197,6 +221,31 @@ class BatchOrchestrator:
                 "role": job.role_name,
                 "output": response,
             }
+    def _build_session_context(self, memory_context: str, last_feedback: str) -> str:
+        sections = []
+        if memory_context.strip():
+            sections.append(f"=== ПРОВЕРЕННЫЙ ОПЫТ ИЗ БАЗЫ НАВЫКОВ ===\n{memory_context.strip()}")
+
+        if self.session_working_commands:
+            working_list = "\n".join(f"- {c[:140]}" for c in self.session_working_commands[-8:])
+            sections.append(
+                "=== КОМАНДЫ, УЖЕ ДАВШИЕ НЕНУЛЕВОЙ ВЫВОД В ЭТОЙ СЕССИИ ===\n"
+                f"{working_list}"
+            )
+
+        if self.session_failed_attempts:
+            failed_list = "\n".join(f"- ⛔ {f}" for f in self.session_failed_attempts[-15:])
+            sections.append(
+                "=== НЕУДАЧНЫЕ ПОПЫТКИ ТЕКУЩЕЙ ЗАДАЧИ (ПОВТОРЯТЬ ЗАПРЕЩЕНО!) ===\n"
+                f"{failed_list}\n"
+                "ОБЯЗАТЕЛЬНО выбери другой источник, другой домен или другой инструмент!"
+            )
+
+        if last_feedback.strip():
+            sections.append(f"=== ВЕРДИКТ КРИТИКА ПО ПРОШЛОЙ ИТЕРАЦИИ ===\n{last_feedback.strip()}")
+
+        return "\n\n".join(sections)
+
     async def _synthesize_results(self, main_task: str, results: List[Dict[str, Any]]) -> str:
         self._check_cancelled()
         grouped = "\n---\n".join(
@@ -204,10 +253,10 @@ class BatchOrchestrator:
             for r in results
         )
         prompt = (
-            f"Главная задача: {main_task}\n\n"
-            f"Ниже приведены результаты работы агентов:\n{grouped}\n\n"
-            f"ЖЁСТКОЕ ТРЕБОВАНИЕ: Отбрось все отписки, предположения, ошибки доступа и советы 'как сделать вручную'. "
-            f"Включи в финальный ответ ТОЛЬКО подтверждённые фактические данные, напрямую решающие задачу."
+            f"Главная задача пользователя: {main_task}\n\n"
+            f"Ниже приведены отчёты агентов:\n{grouped}\n\n"
+            f"ЖЁСТКОЕ ТРЕБОВАНИЕ: Отбрось все неудачные попытки, ошибки доступа, догадки и советы 'сделайте сами'. "
+            f"Собери в финальный ответ ТОЛЬКО реальные фактические данные, напрямую решающие главную задачу."
         )
         return await self.client.generate(
             model=self.executor_model,
@@ -222,22 +271,12 @@ class BatchOrchestrator:
         task_text: str,
         iteration_label: str,
         memory_context: str,
-        dead_ends: List[str],
         last_feedback: str,
     ) -> str:
         self._check_cancelled()
         print(f"\n=== {iteration_label} | Фаза 1: Планирование ({self.executor_model}) ===")
 
-        dead_ends_block = ""
-        if dead_ends:
-            formatted_dead_ends = "\n".join(f"- ЭТИМ ПУТЁМ ИДТИ НЕ НАДО: {d}" for d in dead_ends)
-            dead_ends_block = (
-                "\n⛔ ТУПИКОВЫЕ ПУТИ ТЕКУЩЕЙ ЗАДАЧИ (ПОВТОРЯТЬ ЗАПРЕЩЕНО):\n"
-                f"{formatted_dead_ends}\n"
-                "Построй новый план, использующий принципиально иные источники или методы!\n"
-            )
-
-        full_context = f"{memory_context}\n{dead_ends_block}\n{last_feedback}".strip()
+        full_context = self._build_session_context(memory_context, last_feedback)
         subtasks = await self.planner.decompose(task_text, context=full_context)
         print(f"[+] Сформировано подзадач: {len(subtasks)}")
 
@@ -265,29 +304,30 @@ class BatchOrchestrator:
         print(f"=== Фаза 3: Синтез результатов на модели {self.executor_model} ===")
         return await self._synthesize_results(task_text, raw_results)
     async def run(self, task_text: str) -> str:
-        dead_ends: List[str] = []
         last_feedback = ""
         synthesized_solution = ""
         fast_verified = False
-        self.executed_commands = []
-        self.all_attempted_commands = []
+
+        # Сброс временной памяти текущей задачи
+        self.session_working_commands = []
+        self.session_failed_attempts = []
         print(f"[Workspace] Изолированная папка сессии: {self.workspace_dir}")
 
         memory_context = ""
         try:
             past = await self.memory.search(task_text)
             if past:
-                print("[Memory] Загружен релевантный опыт и анти-паттерны из памяти.")
-                memory_context = f"Записи из памяти (успешные рецепты и тупики):\n{past}\n"
+                print("[Memory] Загружены проверенные решения похожих задач.")
+                memory_context = past
         except Exception as e:
             print(f"[Memory WARN] Поиск в памяти пропущен: {e}")
 
+        # ЭТАП 1: Поиск решения без переключения VRAM с накоплением временного журнала ошибок
         for iteration in range(1, self.max_iterations + 1):
             synthesized_solution = await self._execute_iteration_pipeline(
                 task_text=task_text,
                 iteration_label=f"Итерация {iteration}/{self.max_iterations}",
                 memory_context=memory_context,
-                dead_ends=dead_ends,
                 last_feedback=last_feedback,
             )
 
@@ -308,18 +348,19 @@ class BatchOrchestrator:
                 fast_verified = True
                 break
 
-            recorded_dead_end = dead_end or critique_feedback
-            if recorded_dead_end not in dead_ends:
-                dead_ends.append(recorded_dead_end)
+            if dead_end:
+                self._record_session_failure(f"Подход итерации {iteration}", dead_end)
 
             last_feedback = (
-                f"Замечание критика (итерация {iteration}): {critique_feedback}\n"
-                f"Рекомендуемый альтернативный вектор: {next_strategy}"
+                f"Причина отклонения (итерация {iteration}): {critique_feedback}\n"
+                f"Тупиковый путь: {dead_end or 'не указан'}\n"
+                f"Что сделать по-другому: {next_strategy or 'найти другой источник/инструмент'}"
             ).strip()
-            print(f"[RETRY] Быстрый критик отклонил ответ: {critique_feedback}")
+            print(f"[RETRY] Критик отклонил ответ: {critique_feedback}")
             if next_strategy:
                 print(f"[SEARCH ALT] Новый вектор поиска: {next_strategy}")
 
+        # ЭТАП 2: Финальный глубокий аудит (1 загрузка critic_model в самом конце)
         if fast_verified:
             self._check_cancelled()
             if self.critic_model and self.critic_model != self.executor_model:
@@ -335,14 +376,12 @@ class BatchOrchestrator:
                 if final_status != "SUCCESS":
                     print(f"[FINAL-CRITIC REJECT] Глубокий аудит выявил недочёт: {final_feedback}")
                     dead_end = str(final_verdict.get("dead_end", "")).strip() or final_feedback
-                    if dead_end not in dead_ends:
-                        dead_ends.append(dead_end)
+                    self._record_session_failure("Финальный аудит", dead_end)
 
                     synthesized_solution = await self._execute_iteration_pipeline(
                         task_text=task_text,
                         iteration_label="Финальная доработка после глубокого аудита",
                         memory_context=memory_context,
-                        dead_ends=dead_ends,
                         last_feedback=f"Замечания финального аудитора: {final_feedback}",
                     )
                     recheck = await self.critic.evaluate(
@@ -355,37 +394,31 @@ class BatchOrchestrator:
                 else:
                     print(f"[SUCCESS] Финальный аудитор утвердил решение: {final_feedback}")
 
+        # В постоянную память и навыки сохраняем ТОЛЬКО подтверждённый успех
         if fast_verified:
             try:
                 await self.memory.save(
                     task_text,
                     synthesized_solution,
-                    executed_commands=self.executed_commands,
+                    executed_commands=self.session_working_commands,
                     is_success=True,
                 )
-                print("[Memory] Успешное решение и проверенный навык сохранены.")
+                print("[Memory] Победившее решение и рабочие инструменты сохранены в базу навыков.")
             except Exception as e:
                 print(f"[Memory WARN] Не удалось сохранить опыт: {e}")
+
+            # Очищаем временный журнал ошибок сессии
+            self.session_failed_attempts.clear()
             return synthesized_solution
 
-        final_failure_reason = "; ".join(dead_ends[-3:]) if dead_ends else "Задача не решена за отведённые итерации."
-        print("[FAILED] Задача не выполнена. Фиксируем тупиковый путь в памяти как анти-паттерн.")
-        try:
-            await self.memory.save(
-                task_text,
-                "",
-                executed_commands=self.all_attempted_commands,
-                is_success=False,
-                failure_reason=final_failure_reason,
-            )
-        except Exception as e:
-            print(f"[Memory WARN] Не удалось зафиксировать анти-паттерн: {e}")
+        print("[FAILED] Задача не решена. Временный журнал ошибок очищен, постоянная память не засорена.")
+        failed_summary = "\n".join(f"- ⛔ {item}" for item in self.session_failed_attempts[-8:])
+        self.session_failed_attempts.clear()
 
         return (
             f"## Статус: Задача не выполнена за {self.max_iterations} итераций\n\n"
-            f"Система не приняла неподтверждённые ответы и зафиксировала тупиковые пути в памяти, "
-            f"чтобы не повторять их в будущем:\n"
-            + "\n".join(f"- ⛔ {d}" for d in dead_ends)
+            f"Система отклонила неподтверждённые ответы и не сохранила неудачный запуск в базу навыков.\n\n"
+            f"### Проверенные в сессии тупиковые пути:\n{failed_summary or '- Нет данных'}"
         )
 
 
