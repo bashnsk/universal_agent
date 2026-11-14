@@ -94,6 +94,7 @@ class AgentMemory:
                 return resp.json().get("embedding")
         except Exception:
             return None
+
     async def search(self, query: str, top_k: int = 2, min_score: float = 0.68) -> str:
         if not self.records:
             return ""
@@ -155,6 +156,7 @@ class AgentMemory:
                         "id": skill_data["id"],
                         "file": skill_filename,
                         "task_pattern": task,
+                        "commands": unique_cmds[:5],
                         "created_at": skill_data["created_at"],
                     }
                 )
