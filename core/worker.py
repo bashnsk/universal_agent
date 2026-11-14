@@ -17,7 +17,7 @@ class SubtaskJob:
 
 
 class SubtaskWorker:
-    """Исполнитель одной сессии (подзадача × роль) с bash-песочницей."""
+    """Исполнитель одной сессии (подзадача × роль) с bash-песочницей и кэшем команд сессии."""
 
     def __init__(
         self,
@@ -47,7 +47,12 @@ class SubtaskWorker:
 
     @staticmethod
     def _is_placeholder_command(cmd: str) -> bool:
-        return bool(re.search(r'web_search\.py\s+["\']запрос["\']', cmd.lower()))
+        lowered = cmd.lower()
+        return bool(
+            re.search(r'web_search\.py\s+["\']запрос["\']', lowered)
+            or "example.com" in lowered
+            or "/api/new-" in lowered
+        )
 
     async def execute(self, job: SubtaskJob, context_hint: str) -> Dict[str, Any]:
         async with self.semaphore:
@@ -57,11 +62,11 @@ class SubtaskWorker:
             tool_instruction = (
                 "У тебя есть доступ к bash-песочнице Linux и готовым Python-инструментам:\n"
                 "- Поиск ссылок в интернете: python3 /home/sid/RAID/_AI/universal_agent/skills/web_search.py \"<ключевые_слова_по_задаче>\" --limit 5\n"
-                "- Парсинг одной страницы (BeautifulSoup): python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"<реальный_https_url>\"\n\n"
+                "- Парсинг одной страницы (BeautifulSoup + SPA JSON): python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"<реальный_https_url>\"\n\n"
                 "УНИВЕРСАЛЬНЫЕ ПРАВИЛА:\n"
-                "1. Если в блоке 'УЖЕ НАЙДЕННЫЕ В ЭТОЙ СЕССИИ URL' есть релевантный сайт — парси его или его внутренние разделы через web_parser.py.\n"
-                "2. Если в контексте есть 'ВЫЧЕРКНУТЫЕ НЕРЕЛЕВАНТНЫЕ ДОМЕНЫ' — категорически запрещено обращаться к ним снова!\n"
-                "3. Никогда не пиши в <bash> голый URL без команды и не копируй шаблонные слова вроде 'запрос'.\n"
+                "1. Если в блоке 'УЖЕ ИЗВЛЕЧЁННЫЕ СО СТРАНИЦ ДАННЫЕ' уже есть нужная информация — сразу используй её для ответа без повторного парсинга!\n"
+                "2. Если в блоке 'УЖЕ НАЙДЕННЫЕ В ЭТОЙ СЕССИИ URL' есть релевантный сайт — парси его через web_parser.py.\n"
+                "3. Запрещено выдумывать несуществующие /api/... пути, обращаться к example.com или к вычеркнутым доменам.\n"
                 "4. Для запуска команды выведи строго <bash>команда</bash> без лишнего текста."
             )
 
@@ -89,9 +94,11 @@ class SubtaskWorker:
                 blocked_hit = self.blackboard.find_blocked_domain_in_command(cmd)
 
                 if self._is_placeholder_command(cmd):
-                    shell_out = "[-] Ошибка: Передано шаблонное слово 'запрос'. Укажи реальные ключевые слова по задаче."
+                    shell_out = "[-] Ошибка: Использован вымышленный URL или шаблон. Используй web_search.py для поиска реальных ссылок."
                 elif blocked_hit:
                     shell_out = f"[-] Ошибка: Домен '{blocked_hit}' вычеркнут как нерелевантный. Используй другой источник."
+                elif cmd in self.blackboard.command_cache:
+                    shell_out = self.blackboard.command_cache[cmd]
                 else:
                     print(f"  [Shell #{job.subtask_id}:{job.role_name}] Шаг {step}: {cmd[:95]}...")
                     shell_out = await ShellTool.run(
@@ -99,6 +106,7 @@ class SubtaskWorker:
                         workspace_dir=self.workspace_dir,
                         timeout=20.0,
                     )
+                    self.blackboard.command_cache[cmd] = shell_out
                     is_ok, fail_reason = self.blackboard.harvest_output(cmd, shell_out)
                     if not is_ok:
                         self.blackboard.record_failure(cmd, fail_reason)

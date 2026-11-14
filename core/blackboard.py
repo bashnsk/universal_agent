@@ -1,5 +1,5 @@
 import re
-from typing import List
+from typing import List, Dict
 from urllib.parse import urlparse
 
 
@@ -12,6 +12,7 @@ class SessionBlackboard:
         self.discovered_urls: List[str] = []
         self.extracted_facts: List[str] = []
         self.blocked_domains: List[str] = []
+        self.command_cache: Dict[str, str] = {}
 
     def clear(self) -> None:
         self.working_commands.clear()
@@ -19,6 +20,7 @@ class SessionBlackboard:
         self.discovered_urls.clear()
         self.extracted_facts.clear()
         self.blocked_domains.clear()
+        self.command_cache.clear()
 
     @staticmethod
     def extract_domain(url_or_domain: str) -> str:
@@ -27,7 +29,7 @@ class SessionBlackboard:
             return ""
         if "://" not in raw:
             raw = "https://" + raw
-        host = urlparse(raw).netloc.split(":")[0]
+        host = urlparse(raw).netloc.split(":")
         return host[4:] if host.startswith("www.") else host
 
     def block_domain(self, domain_or_url: str) -> None:
@@ -65,7 +67,7 @@ class SessionBlackboard:
         if "[EXIT CODE]: 0" not in shell_out or "[STDOUT]:" not in shell_out:
             return False, "ошибка выполнения или пустой вывод"
 
-        stdout_part = shell_out.split("[STDOUT]:", 1)[1].strip()
+        stdout_part = shell_out.split("[STDOUT]:", 1).strip()
         if len(stdout_part) < 25:
             return False, "слишком короткий ответ"
 
@@ -84,8 +86,8 @@ class SessionBlackboard:
             if clean_u not in self.discovered_urls and len(self.discovered_urls) < 35:
                 self.discovered_urls.append(clean_u)
 
-        if "web_parser.py" in cmd and "=== ТЕКСТОВЫЕ ДАННЫЕ ===" in stdout_part:
-            snippet = stdout_part[:1200]
+        if "web_parser.py" in cmd and ("=== СТРУКТУРИРОВАННЫЕ ДАННЫЕ" in stdout_part or "=== ТЕКСТОВЫЕ ДАННЫЕ ===" in stdout_part):
+            snippet = stdout_part[:1800]
             if snippet not in self.extracted_facts and len(self.extracted_facts) < 6:
                 self.extracted_facts.append(snippet)
 
@@ -134,7 +136,7 @@ class SessionBlackboard:
 
         if self.extracted_facts:
             facts_blob = "\n---\n".join(self.extracted_facts[-3:])
-            sections.append(f"=== УЖЕ ИЗВЛЕЧЁННЫЕ СО СТРАНИЦ ДАННЫЕ ТЕКУЩЕЙ СЕССИИ ===\n{facts_blob[:3000]}")
+            sections.append(f"=== УЖЕ ИЗВЛЕЧЁННЫЕ СО СТРАНИЦ ДАННЫЕ ТЕКУЩЕЙ СЕССИИ ===\n{facts_blob[:3500]}")
 
         if self.failed_attempts:
             failed_list = "\n".join(f"- ⛔ {f}" for f in self.failed_attempts[-15:])
