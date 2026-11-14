@@ -1,0 +1,10 @@
+{
+  "id": "skill_web_search",
+  "created_at": "2026-11-14T23:50:00",
+  "task_pattern": "Поиск реальных URL, официальных сайтов и актуальных страниц в интернете по запросу без угадывания доменов",
+  "commands": [
+    "python3 /home/sid/RAID/_AI/universal_agent/skills/web_search.py \"поисковый запрос\"",
+    "python3 /home/sid/RAID/_AI/universal_agent/skills/web_search.py \"поисковый запрос\" --limit 5"
+  ],
+  "summary": "CLI-инструмент поиска реальных ссылок в интернете на Python + BeautifulSoup. Возвращает точные URL, заголовки и сниппеты для последующей передачи в web_parser.py."
+}

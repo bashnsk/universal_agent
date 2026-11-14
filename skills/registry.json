@@ -1,5 +1,14 @@
 [
   {
+    "id": "skill_web_search",
+    "file": "skill_web_search.json",
+    "task_pattern": "Поиск реальных URL, официальных сайтов и актуальных страниц в интернете по запросу без угадывания доменов",
+    "commands": [
+      "python3 /home/sid/RAID/_AI/universal_agent/skills/web_search.py \"поисковый запрос\""
+    ],
+    "created_at": "2026-11-14T23:50:00"
+  },
+  {
     "id": "skill_web_parser",
     "file": "skill_web_parser.json",
     "task_pattern": "Парсинг и извлечение данных, списков, новостей или ссылок с любых веб-страниц через Python и BeautifulSoup",
