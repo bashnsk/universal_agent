@@ -1,42 +1,28 @@
 import asyncio
-import shlex
+import os
+import re
+from pathlib import Path
+from typing import Optional
+
 
 class ShellTool:
-    # Запрещенные утилиты (только как отдельное имя команды)
-    FORBIDDEN_COMMANDS = {"top", "htop", "rm -rf /", "shutdown", "reboot", "poweroff"}
+    FORBIDDEN_COMMANDS = {
+        "top", "htop", "vim", "vi", "nano", "less", "more", "man",
+        "shutdown", "reboot", "poweroff", "init", "mkfs", "dd", "fdisk"
+    }
 
-    @staticmethod
-    async def run(command: str) -> str:
-        cmd_trimmed = command.strip()
-        
-        # Точная проверка вызова опасных системных утилит
-        first_word = cmd_trimmed.split()[0] if cmd_trimmed.split() else ""
-        if first_word in ShellTool.FORBIDDEN_COMMANDS or cmd_trimmed in ShellTool.FORBIDDEN_COMMANDS:
-            return f"[-] Ошибка безопасности: Команда '{first_word}' заблокирована песочницей."
+    FORBIDDEN_PATTERNS = [
+        r"rm\s+(-[a-zA-Z]*r[a-zA-Z]*f|-[a-zA-Z]*f[a-zA-Z]*r)\s+/",
+        r":\(\)\{\s*:\|\:&\s*\};:",
+        r">\s*/dev/sd",
+    ]
 
-        if "rm -rf /" in cmd_trimmed:
-            return "[-] Ошибка безопасности: Команда опасна и заблокирована."
+    DEFAULT_WORKSPACE = Path("/home/sid/RAID/_AI/universal_agent/storage/workspace")
 
-        try:
-            process = await asyncio.create_subprocess_shell(
-                command,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.PIPE
-            )
-            
-            try:
-                stdout, stderr = await asyncio.wait_for(process.communicate(), timeout=30.0)
-            except asyncio.TimeoutError:
-                process.kill()
-                return "[-] Ошибка: Превышен таймаут выполнения команды (30 сек)."
-
-            output = ""
-            if stdout:
-                output += f"[STDOUT]:\n{stdout.decode('utf-8', errors='ignore')}\n"
-            if stderr:
-                output += f"[STDERR]:\n{stderr.decode('utf-8', errors='ignore')}\n"
-            
-            return output if output else "[Команда выполнена успешно без вывода]"
-
-        except Exception as e:
-            return f"[-] Ошибка выполнения команды: {str(e)}"
+    @classmethod
+    def _sanitize_command(cls, command: str) -> str:
+        cmd = command.strip()
+        cmd = re.sub(r"\bapt-get\s+install\b(?!.*-y)", "apt-get install -y", cmd)
+        cmd = re.sub(r"\bapt\s+install\b(?!.*-y)", "apt install -y", cmd)
+        cmd = re.sub(r"\bpip\s+install\b(?!.*--no-input)", "pip install --no-input", cmd)
+        return cmd

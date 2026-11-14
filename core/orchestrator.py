@@ -1,10 +1,14 @@
 import asyncio
+import re
+from datetime import datetime
 from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Dict, Any
 from agents.base import OllamaClient
 from core.planner import TaskPlanner
 from core.critic import CriticAgent
 from core.memory import AgentMemory
+from tools.shell import ShellTool
 
 
 @dataclass
@@ -38,21 +42,31 @@ class BatchOrchestrator:
         self.multi_role_count = int(exec_cfg.get("multi_role_count", 3))
         self.context_window = int(exec_cfg.get("context_window", 8192))
 
+        workspace_base = Path(
+            paths_cfg.get(
+                "workspace_root",
+                "/home/sid/RAID/_AI/universal_agent/storage/workspace",
+            )
+        )
+        session_id = datetime.now().strftime("session_%Y%m%d_%H%M%S")
+        self.workspace_dir = workspace_base / session_id
+        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+
         default_roles = [
             {
                 "name": "Senior_Developer",
                 "temperature": 0.2,
-                "system_prompt": "Ты ведущий разработчик. Пиши чистый, рабочий код без заглушек. Учитывай крайние случаи.",
+                "system_prompt": "Ты ведущий разработчик. Пиши чистый, рабочий код и команды без заглушек.",
             },
             {
                 "name": "System_Architect",
                 "temperature": 0.3,
-                "system_prompt": "Ты системный архитектор Linux/DevOps. Оценивай надёжность, права доступа, пути и зависимости.",
+                "system_prompt": "Ты системный архитектор Linux/DevOps. Проверяй источники данных, сети и зависимости.",
             },
             {
                 "name": "EdgeCase_Tester",
                 "temperature": 0.4,
-                "system_prompt": "Ты инженер по тестированию и безопасности. Ищи уязвимости, ошибки парсинга и сбои окружения.",
+                "system_prompt": "Ты инженер по проверке фактов и тестированию. Никогда не выдумывай данные, проверяй их через инструменты.",
             },
         ]
         all_roles = exec_cfg.get("roles", default_roles)
@@ -68,7 +82,8 @@ class BatchOrchestrator:
         self.critic = CriticAgent(self.client, self.critic_model)
 
         skills_path = paths_cfg.get(
-            "skills_registry", "/home/sid/RAID/_AI/universal_agent/skills/registry.json"
+            "skills_registry",
+            "/home/sid/RAID/_AI/universal_agent/skills/registry.json",
         )
         self.memory = AgentMemory(
             storage_path=skills_path,
@@ -78,7 +93,6 @@ class BatchOrchestrator:
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
 
     def cancel(self):
-        """Остановка всех текущих задач по кнопке из WebUI."""
         self._cancelled = True
         for t in self._active_tasks:
             if not t.done():
@@ -87,17 +101,24 @@ class BatchOrchestrator:
     def _check_cancelled(self):
         if self._cancelled:
             raise asyncio.CancelledError("Задача отменена пользователем.")
-
     async def _run_single_job(self, job: SubtaskJob, context_hint: str) -> Dict[str, Any]:
-        """Выполнение одной сессии подзадачи в рамках лимита параллельных слотов VRAM."""
         async with self.semaphore:
             self._check_cancelled()
             print(f"[Queue -> GPU] Подзадача #{job.subtask_id} | Роль: {job.role_name}")
-            prompt = (
-                f"Контекст из памяти и прошлых итераций:\n{context_hint}\n\n"
-                f"Твоя узкая подзадача:\n{job.description}\n\n"
-                f"Выдай точное, структурированное и готовое к применению решение."
+
+            tool_instruction = (
+                "У тебя есть доступ к bash-песочнице Linux (с выходом в интернет, curl, python3). "
+                "Если для точного ответа нужны реальные данные из интернета или системы (никогда не выдумывай факты!), "
+                "выведи команду строго внутри тегов <bash>команда</bash> и больше ничего не пиши. "
+                "Если данные уже есть или команда не нужна — сразу дай готовый структурированный ответ."
             )
+
+            prompt = (
+                f"{tool_instruction}\n\n"
+                f"Контекст из памяти и прошлых итераций:\n{context_hint}\n\n"
+                f"Твоя узкая подзадача:\n{job.description}"
+            )
+
             response = await self.client.generate(
                 model=self.executor_model,
                 prompt=prompt,
@@ -105,6 +126,31 @@ class BatchOrchestrator:
                 temperature=job.temperature,
                 num_ctx=self.context_window,
             )
+
+            for step in range(1, 3):
+                bash_match = re.search(r"<bash>(.*?)</bash>", response, re.DOTALL)
+                if not bash_match:
+                    break
+
+                self._check_cancelled()
+                cmd = bash_match.group(1).strip()
+                print(f"  [Shell #{job.subtask_id}:{job.role_name}] Выполнение: {cmd[:90]}...")
+                shell_out = await ShellTool.run(cmd, workspace_dir=str(self.workspace_dir))
+
+                followup_prompt = (
+                    f"Ты запросил выполнение команды:\n{cmd}\n\n"
+                    f"Результат выполнения из песочницы:\n{shell_out}\n\n"
+                    f"На основе этих реальных данных заверши свою подзадачу: {job.description}\n"
+                    f"(Если нужна ещё одна уточняющая команда — используй <bash>...</bash>, иначе дай итоговый ответ)."
+                )
+                response = await self.client.generate(
+                    model=self.executor_model,
+                    prompt=followup_prompt,
+                    system_prompt=job.system_prompt,
+                    temperature=job.temperature,
+                    num_ctx=self.context_window,
+                )
+
             return {
                 "subtask_id": job.subtask_id,
                 "description": job.description,
@@ -113,7 +159,6 @@ class BatchOrchestrator:
             }
 
     async def _synthesize_results(self, main_task: str, results: List[Dict[str, Any]]) -> str:
-        """Сборка единого решения из мультиролевых ответов на текущей загруженной модели."""
         self._check_cancelled()
         grouped = "\n---\n".join(
             f"Подзадача #{r['subtask_id']} ({r['description']}) [Роль: {r['role']}]:\n{r['output']}"
@@ -121,8 +166,8 @@ class BatchOrchestrator:
         )
         prompt = (
             f"Главная задача: {main_task}\n\n"
-            f"Ниже приведены решения подзадач от разных ролей. "
-            f"Сравни их, отбрось ошибочные варианты, объедини лучшие находки и сформируй итоговый ответ:\n\n"
+            f"Ниже приведены решения подзадач от разных ролей (включая данные, полученные из интернета и терминала). "
+            f"Сравни их, отбрось выдумки и ошибочные варианты, объедини проверенные факты и сформируй итоговый ответ:\n\n"
             f"{grouped}"
         )
         return await self.client.generate(
@@ -136,8 +181,8 @@ class BatchOrchestrator:
     async def run(self, task_text: str) -> str:
         feedback = ""
         synthesized_solution = ""
+        print(f"[Workspace] Изолированная папка сессии: {self.workspace_dir}")
 
-        # Поиск релевантного прошлого опыта в памяти (если метод search реализован в AgentMemory)
         memory_context = ""
         if hasattr(self.memory, "search"):
             try:
@@ -154,7 +199,6 @@ class BatchOrchestrator:
             subtasks = await self.planner.decompose(task_text, context=full_context)
             print(f"[+] Сформировано подзадач: {len(subtasks)}")
 
-            # Формируем единую очередь (все подзадачи × все активные роли) для одной модели
             job_queue: List[SubtaskJob] = []
             for idx, sub in enumerate(subtasks, start=1):
                 for role in self.active_roles:
@@ -179,7 +223,6 @@ class BatchOrchestrator:
             print(f"=== Фаза 3: Синтез результатов на модели {self.executor_model} ===")
             synthesized_solution = await self._synthesize_results(task_text, raw_results)
 
-            # Переключаем модель в VRAM ровно 1 раз за итерацию для проверки критиком
             print(f"=== Фаза 4: Проверка критиком ({self.critic_model}) ===")
             verdict = await self.critic.evaluate(task_text, synthesized_solution)
 
@@ -202,5 +245,4 @@ class BatchOrchestrator:
         return synthesized_solution
 
 
-# Псевдоним для web/server.py
 Orchestrator = BatchOrchestrator
