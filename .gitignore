@@ -1,0 +1,36 @@
+# Python и виртуальное окружение
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+
+# Логи и временные артефакты тестов (в т.ч. текущие файлы в корне)
+*.log
+current_data.txt
+output.txt
+processed_data.json
+test_tasks.txt
+scrape_europe_plus.py
+
+# Изолированные песочницы, память и история задач
+storage/workspace/*
+storage/tasks/*
+storage/memory/*
+storage/logs/*
+
+# Сохраняем структуру директорий в Git через .gitkeep
+!storage/workspace/.gitkeep
+!storage/tasks/.gitkeep
+!storage/memory/.gitkeep
+!storage/logs/.gitkeep
+
+# Секреты и системные файлы
+.env
+*.bak
+*.swp
+.DS_Store
+.vscode/
+.idea/

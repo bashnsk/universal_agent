@@ -1,9 +1,31 @@
-execution:
-  max_iterations: 10
-  max_subtask_retries: 3
-  multi_role_count: 3
 ollama:
-  base_url: http://localhost:11434
-  critic_model: deepseek-r1:8b
-  default_model: qwen3.5:9b
-  timeout: 120
+  base_url: "http://127.0.0.1:11434"
+  timeout: 300
+  max_concurrent_requests: 4  # Соответствует OLLAMA_NUM_PARALLEL
+  keep_alive: "10m"           # Держим текущую модель в VRAM на время всей фазы
+
+models:
+  planner: "qwen2.5-coder:14b"
+  executor: "qwen2.5-coder:14b"
+  critic: "deepseek-r1:14b"   # Загрузится только ПОСЛЕ завершения всех задач executor
+  embedder: "nomic-embed-text:latest"
+
+execution:
+  max_iterations: 5           # Максимум глобальных циклов доработки после критика
+  context_window: 8192        # Оптимальный размер окна для 4 параллельных слотов в 16 ГБ
+  roles:
+    - name: "Senior_Developer"
+      temperature: 0.2
+      system_prompt: "Ты ведущий разработчик. Пиши чистый, рабочий код без заглушек. Учитывай крайние случаи."
+    - name: "System_Architect"
+      temperature: 0.3
+      system_prompt: "Ты системный архитектор Linux/DevOps. Оценивай надёжность, права доступа, пути и зависимости."
+    - name: "EdgeCase_Tester"
+      temperature: 0.4
+      system_prompt: "Ты инженер по тестированию и безопасности. Ищи уязвимости, ошибки парсинга и сбои окружения."
+
+paths:
+  workspace_root: "storage/workspace"
+  tasks_archive: "storage/tasks"
+  skills_dir: "skills"
+  memory_db: "storage/memory/vector_store.db"

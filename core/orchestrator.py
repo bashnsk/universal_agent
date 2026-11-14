@@ -1,126 +1,112 @@
 import asyncio
-import re
+import json
+from dataclasses import dataclass
+from typing import List, Dict, Any
 from agents.base import OllamaClient
-from core.planner import TaskPlanner
-from core.critic import CriticAgent
-from core.memory import AgentMemory
-from tools.shell import ShellTool
+from core.planner import Planner
+from core.critic import Critic
 
-class Orchestrator:
-    def __init__(self, config: dict):
-        self.client = OllamaClient(base_url=config["ollama"]["base_url"])
-        self.model = config["ollama"]["default_model"]
-        self.critic_model = config["ollama"]["critic_model"]
-        self.max_iterations = config["execution"]["max_iterations"]
-        self.multi_role_count = config["execution"]["multi_role_count"]
+@dataclass
+class SubtaskJob:
+    subtask_id: int
+    description: str
+    role_name: str
+    system_prompt: str
+    temperature: float
 
-        self.planner = TaskPlanner(self.client, self.model)
-        self.critic = CriticAgent(self.client, self.critic_model)
-        self.memory = AgentMemory()
-        self.is_cancelled = False  # Флаг отмены
-
-    def cancel(self):
-        self.is_cancelled = True
-
-    async def execute_subtask_with_roles(self, subtask: str) -> str:
-        if self.is_cancelled:
-            raise asyncio.CancelledError("Задача была отменена пользователем.")
-
-        system_base = (
-            "Ты универсальный ИИ-агент с доступом к Debian Linux и поисковому модулю DuckDuckGo. "
-            "Для поиска актуальной информации в сети используй быстрый однострочник на Python через duckduckgo_search, например:\n"
-            "```bash\n"
-            "python3 -c \"from duckduckgo_search import DDGS; print([r['title'] + ' - ' + r['body'] for r in DDGS().text('Европа Плюс топ хитов', max_results=5)])\"\n"
-            "```\n"
-            "Если нужен парсинг страницы, используй Python urllib с заголовком User-Agent: Mozilla/5.0. "
-            "Все bash-команды пиши внутри блоков ```bash ... ```."
+class BatchOrchestrator:
+    def __init__(self, config: Dict[str, Any], log_callback=None):
+        self.cfg = config
+        self.client = OllamaClient(
+            base_url=config["ollama"]["base_url"],
+            timeout=config["ollama"]["timeout"],
+            keep_alive=config["ollama"]["keep_alive"]
         )
+        self.planner = Planner(self.client, config["models"]["planner"])
+        self.critic = Critic(self.client, config["models"]["critic"])
+        self.semaphore = asyncio.Semaphore(config["ollama"]["max_concurrent_requests"])
+        self.log = log_callback or print
 
-        roles = [
-            f"{system_base} Ты экспертный исследователь и аналитик данных.",
-            f"{system_base} Ты системный инженер, умеющий работать с консольными утилитами.",
-            f"{system_base} Ты практик, ориентированный на точный результат."
-        ]
-        
-        tasks = []
-        for i in range(min(self.multi_role_count, len(roles))):
-            tasks.append(
-                self.client.generate(self.model, f"Выполни подзадачу: {subtask}", system_prompt=roles[i])
+    async def _run_single_job(self, job: SubtaskJob, context_hint: str) -> Dict[str, Any]:
+        """Выполнение одной атомарной сессии в рамках лимита параллельных слотов VRAM."""
+        async with self.semaphore:
+            self.log(f"[Queue -> GPU] Подзадача #{job.subtask_id} | Роль: {job.role_name}")
+            prompt = (
+                f"Контекст из памяти/прошлых шагов:\n{context_hint}\n\n"
+                f"Твоя узкая подзадача:\n{job.description}\n\n"
+                f"Выдай точное, готовое к применению решение."
             )
-        
-        results = await asyncio.gather(*tasks)
-        
-        if self.is_cancelled:
-            raise asyncio.CancelledError("Задача была отменена пользователем.")
+            response = await self.client.generate(
+                model=self.cfg["models"]["executor"],
+                prompt=prompt,
+                system=job.system_prompt,
+                options={
+                    "temperature": job.temperature,
+                    "num_ctx": self.cfg["execution"]["context_window"]
+                }
+            )
+            return {
+                "subtask_id": job.subtask_id,
+                "description": job.description,
+                "role": job.role_name,
+                "output": response
+            }
 
-        processed_results = []
-        for res in results:
-            bash_matches = re.findall(r'```bash(.*?)```', res, re.DOTALL)
-            if bash_matches:
-                cmd = bash_matches[0].strip()
-                print(f"[🛠️ Tool Execution] Выполнение команды от агента: {cmd}")
-                tool_output = await ShellTool.run(cmd)
-                print(f"[🛠️ Tool Output]: {tool_output[:300]}...")
-                
-                final_prompt = f"Подзадача: {subtask}\n\nКоманда:\n{cmd}\n\nРезультат выполнения из консоли:\n{tool_output}\n\nСформируй финальный ответ на основе этих данных."
-                res = await self.client.generate(self.model, final_prompt, system_prompt=roles[0])
-            
-            processed_results.append(res)
+    async def execute_pipeline(self, main_task: str, memory_context: str = "") -> str:
+        feedback = ""
+        max_iters = self.cfg["execution"]["max_iterations"]
 
-        synth_prompt = f"Синтезируй лучшие части из следующих решений для подзадачи '{subtask}':\n\n"
-        for idx, res in enumerate(processed_results):
-            synth_prompt += f"--- Вариант {idx+1} ---\n{res}\n\n"
-        
-        final_subtask_result = await self.client.generate(
-            self.model, 
-            synth_prompt, 
-            system_prompt="Ты интегратор. Объедини лучшие решения в одно идеальное финальное решение подзадачи."
+        for iteration in range(1, max_iters + 1):
+            self.log(f"=== Итерация {iteration}/{max_iters} | Фаза 1: Планирование ({self.cfg['models']['planner']}) ===")
+            subtasks = await self.planner.decompose(main_task, memory_context, feedback)
+
+            # Формируем единую очередь (все подзадачи × все роли) для одной модели
+            job_queue: List[SubtaskJob] = []
+            for idx, sub in enumerate(subtasks, start=1):
+                for role in self.cfg["execution"]["roles"]:
+                    job_queue.append(SubtaskJob(
+                        subtask_id=idx,
+                        description=sub,
+                        role_name=role["name"],
+                        system_prompt=role["system_prompt"],
+                        temperature=role["temperature"]
+                    ))
+
+            self.log(f"=== Фаза 2: Очередь из {len(job_queue)} сессий на {self.cfg['models']['executor']} ===")
+            tasks = [self._run_single_job(job, f"{memory_context}\n{feedback}") for job in job_queue]
+            raw_results = await asyncio.gather(*tasks)
+
+            # Аккумуляция и арбитраж лучших ответов на той же модели (без перезагрузки VRAM)
+            self.log(f"=== Фаза 3: Синтез результатов на {self.cfg['models']['executor']} ===")
+            synthesized_solution = await self._synthesize_results(main_task, raw_results)
+
+            # Переключение модели в VRAM строго 1 раз за итерацию для финального аудита
+            self.log(f"=== Фаза 4: Проверка критиком ({self.cfg['models']['critic']}) ===")
+            verdict = await self.critic.evaluate(main_task, synthesized_solution)
+
+            if verdict["status"] == "SUCCESS":
+                self.log("[SUCCESS] Критик утвердил решение.")
+                return synthesized_solution
+
+            feedback = f"Замечания критика с итерации {iteration}: {verdict['critique']}"
+            self.log(f"[RETRY] Требуется доработка: {verdict['critique']}")
+
+        return synthesized_solution
+
+    async def _synthesize_results(self, main_task: str, results: List[Dict[str, Any]]) -> str:
+        """Сборка единого решения из мультиролевых ответов на текущей загруженной модели."""
+        grouped = "\n---\n".join(
+            f"Подзадача #{r['subtask_id']} ({r['description']}) [Роль: {r['role']}]:\n{r['output']}"
+            for r in results
         )
-        return final_subtask_result
-
-    async def run(self, main_task: str):
-        print(f"[+] Старт задачи: {main_task}")
-        
-        cached_solution = await self.memory.find_similar(main_task)
-        context = ""
-        if cached_solution:
-            print("[+] Контекст извлечен из памяти успешных задач прошлого опыта.")
-            context = f"Найден похожий успешный опыт из прошлого:\n{cached_solution}\n\n"
-
-        for iteration in range(1, self.max_iterations + 1):
-            if self.is_cancelled:
-                raise asyncio.CancelledError("Задача была отменена пользователем.")
-
-            print(f"\n--- Итерация {iteration}/{self.max_iterations} ---")
-            
-            subtasks = await self.planner.decompose(main_task, context)
-            print(f"[+] Декомпозиция на подзадачи: {subtasks}")
-
-            subtask_results = []
-            for st in subtasks:
-                if self.is_cancelled:
-                    raise asyncio.CancelledError("Задача была отменена пользователем.")
-                print(f" -> Выполнение подзадачи (в {self.multi_role_count} ролях): {st}")
-                res = await self.execute_subtask_with_roles(st)
-                subtask_results.append(f"Подзадача: {st}\nРезультат:\n{res}")
-
-            accumulated = "\n\n".join(subtask_results)
-            
-            if self.is_cancelled:
-                raise asyncio.CancelledError("Задача была отменена пользователем.")
-
-            print("[+] Запуск проверки критиком...")
-            evaluation = await self.critic.evaluate(main_task, accumulated)
-            
-            print(f"[+] Вердикт критика: {evaluation.get('status')}")
-            print(f"[+] Отзыв: {evaluation.get('feedback')}")
-
-            if evaluation.get("status") == "SUCCESS":
-                print("[+] Задача успешно выполнена и прошла верификацию!")
-                await self.memory.save_success(main_task, accumulated)
-                return accumulated
-            else:
-                context = f"Предыдущая попытка не прошла проверку. Замечания критика: {evaluation.get('feedback')}"
-
-        print("[-] Достигнут лимит итераций. Задача не завершена идеально.")
-        return accumulated
+        prompt = (
+            f"Главная задача: {main_task}\n\n"
+            f"Ниже приведены решения подзадач от разных специалистов. "
+            f"Сравни их, отбрось ошибочные варианты, возьми лучшие технические решения и собери единый целостный результат:\n\n"
+            f"{grouped}"
+        )
+        return await self.client.generate(
+            model=self.cfg["models"]["executor"],
+            prompt=prompt,
+            options={"temperature": 0.1, "num_ctx": self.cfg["execution"]["context_window"]}
+        )
