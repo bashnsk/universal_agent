@@ -27,9 +27,11 @@ class BatchOrchestrator:
         self._cancelled = False
         self._active_tasks: List[asyncio.Task] = []
 
-        # Оперативная память текущей сессии (очищается после завершения задачи)
+        # Оперативная память текущей сессии (Session Blackboard)
         self.session_working_commands: List[str] = []
         self.session_failed_attempts: List[str] = []
+        self.session_discovered_urls: List[str] = []
+        self.session_extracted_facts: List[str] = []
 
         ollama_cfg = config.get("ollama", {})
         exec_cfg = config.get("execution", {})
@@ -65,17 +67,17 @@ class BatchOrchestrator:
             {
                 "name": "Senior_Developer",
                 "temperature": 0.2,
-                "system_prompt": "Ты ведущий разработчик. Пиши рабочий код, парсеры и скрипты, извлекающие реальные данные без заглушек.",
+                "system_prompt": "Ты ведущий разработчик. Извлекаешь реальные структурированные данные без заглушек.",
             },
             {
                 "name": "System_Architect",
                 "temperature": 0.3,
-                "system_prompt": "Ты системный архитектор и исследователь. Находишь реальные источники данных и рабочие инструменты вместо угадывания.",
+                "system_prompt": "Ты системный исследователь. Находишь точные внутренние разделы сайтов и рабочие источники.",
             },
             {
                 "name": "EdgeCase_Tester",
                 "temperature": 0.4,
-                "system_prompt": "Ты инженер верификации. Проверяешь фактический вывод команд и отбрасываешь пустые или ошибочные ответы.",
+                "system_prompt": "Ты инженер верификации. Отсекаешь страницы 404, пустые списки и неподтверждённые данные.",
             },
         ]
         all_roles = exec_cfg.get("roles", default_roles)
@@ -134,6 +136,14 @@ class BatchOrchestrator:
         if self._cancelled:
             raise asyncio.CancelledError("Задача отменена пользователем.")
 
+    def _normalize_bash_command(self, raw_cmd: str) -> str:
+        cmd = raw_cmd.strip().strip("`")
+        # Если агент написал просто URL без команды — автоматически передаём его в web_parser.py
+        if re.match(r"^['\"]?https?://\S+['\"]?$", cmd):
+            clean_url = cmd.strip("'\"")
+            return f'python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py "{clean_url}"'
+        return cmd
+
     def _record_session_failure(self, cmd: str, reason: str) -> None:
         short_cmd = cmd.strip().replace("\n", " ")[:120]
         short_reason = reason.strip().replace("\n", " ")[:140]
@@ -141,14 +151,31 @@ class BatchOrchestrator:
         if entry not in self.session_failed_attempts:
             self.session_failed_attempts.append(entry)
 
-    def _is_command_output_useful(self, shell_out: str) -> tuple[bool, str]:
-        if "[EXIT CODE]: 0" not in shell_out:
-            return False, "ненулевой код возврата или ошибка выполнения"
-        if "[STDOUT]:" not in shell_out:
-            return False, "пустой вывод (нет данных)"
+    def _harvest_session_progress(self, cmd: str, shell_out: str) -> tuple[bool, str]:
+        if "[EXIT CODE]: 0" not in shell_out or "[STDOUT]:" not in shell_out:
+            return False, "ошибка выполнения или пустой вывод"
+
         stdout_part = shell_out.split("[STDOUT]:", 1)[1].strip()
-        if len(stdout_part) < 15:
-            return False, "слишком короткий или пустой ответ"
+        if len(stdout_part) < 25:
+            return False, "слишком короткий ответ"
+
+        lowered = stdout_part.lower()
+        if "страница не найдена" in lowered or "404 not found" in lowered or "результатов не найдено" in lowered:
+            return False, "страница 404 или пустой поиск"
+
+        # Сохраняем все найденные реальные URL в общую доску сессии
+        found_urls = re.findall(r"https?://[^\s\"'<>)\]]+", stdout_part)
+        for u in found_urls:
+            clean_u = u.rstrip(".,;:")
+            if clean_u not in self.session_discovered_urls and len(self.session_discovered_urls) < 35:
+                self.session_discovered_urls.append(clean_u)
+
+        # Если это результат работы web_parser.py — сохраняем выжимку фактов на доску сессии
+        if "web_parser.py" in cmd and "=== ТЕКСТОВЫЕ ДАННЫЕ ===" in stdout_part:
+            snippet = stdout_part[:1200]
+            if snippet not in self.session_extracted_facts and len(self.session_extracted_facts) < 6:
+                self.session_extracted_facts.append(snippet)
+
         return True, ""
 
     async def _run_single_job(self, job: SubtaskJob, context_hint: str) -> Dict[str, Any]:
@@ -161,10 +188,11 @@ class BatchOrchestrator:
                 "- Поиск ссылок в интернете: python3 /home/sid/RAID/_AI/universal_agent/skills/web_search.py \"запрос\" --limit 5\n"
                 "- Парсинг одной страницы (BeautifulSoup): python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"https://реальный_url\"\n\n"
                 "УНИВЕРСАЛЬНЫЕ ПРАВИЛА:\n"
-                "1. Для поиска в сети ВСЕГДА используй web_search.py, а для чтения страницы — передай ОДИН конкретный реальный URL в web_parser.py. "
-                "ЗАПРЕЩЕНО делать прямой curl к ://google.com и использовать шаблоны вроде <URL1>.\n"
-                "2. Никогда не повторяй команды из блока 'НЕУДАЧНЫЕ ПОПЫТКИ ТЕКУЩЕЙ ЗАДАЧИ'.\n"
-                "3. Для запуска команды выведи строго <bash>команда</bash> без лишнего текста. "
+                "1. Если в блоке 'УЖЕ НАЙДЕННЫЕ В ЭТОЙ СЕССИИ URL' уже есть подходящий сайт — НЕ ищи его заново через web_search.py, "
+                "сразу парси его или его внутренние разделы через web_parser.py!\n"
+                "2. Никогда не пиши в <bash> голый URL без команды — всегда пиши полный вызов python3 .../web_parser.py \"https://...\".\n"
+                "3. Никогда не повторяй команды и страницы 404 из блока 'НЕУДАЧНЫЕ ПОПЫТКИ ТЕКУЩЕЙ ЗАДАЧИ'.\n"
+                "4. Для запуска команды выведи строго <bash>команда</bash> без лишнего текста. "
                 "Когда реальные факты получены — дай чёткий итоговый ответ."
             )
 
@@ -182,21 +210,21 @@ class BatchOrchestrator:
                 num_ctx=self.context_window,
             )
 
-            for step in range(1, 3):
+            for step in range(1, 4):
                 bash_match = re.search(r"<bash>(.*?)</bash>", response, re.DOTALL)
                 if not bash_match:
                     break
 
                 self._check_cancelled()
-                cmd = bash_match.group(1).strip()
-                print(f"  [Shell #{job.subtask_id}:{job.role_name}] Шаг {step}: {cmd[:90]}...")
+                cmd = self._normalize_bash_command(bash_match.group(1))
+                print(f"  [Shell #{job.subtask_id}:{job.role_name}] Шаг {step}: {cmd[:95]}...")
                 shell_out = await ShellTool.run(
                     cmd,
                     workspace_dir=str(self.workspace_dir),
                     timeout=20.0,
                 )
 
-                is_ok, fail_reason = self._is_command_output_useful(shell_out)
+                is_ok, fail_reason = self._harvest_session_progress(cmd, shell_out)
                 if is_ok:
                     if cmd not in self.session_working_commands:
                         self.session_working_commands.append(cmd)
@@ -206,8 +234,9 @@ class BatchOrchestrator:
                 followup_prompt = (
                     f"Выполнена команда:\n{cmd}\n\n"
                     f"Вывод песочницы:\n{shell_out}\n\n"
-                    f"Если получены ссылки через web_search.py — передай ОДИН лучший реальный URL в web_parser.py через <bash>...</bash>. "
-                    f"Если факты уже получены — дай точный итоговый ответ по подзадаче: {job.description}"
+                    f"Если в выводе есть нужная внутренняя ссылка (раздел с данными/новинками/чартом) — "
+                    f"распарси её следующим шагом через <bash>python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"URL\"</bash>. "
+                    f"Если конкретные данные уже извлечены — дай точный итоговый ответ по подзадаче: {job.description}"
                 )
                 response = await self.client.generate(
                     model=self.executor_model,
@@ -223,25 +252,30 @@ class BatchOrchestrator:
                 "role": job.role_name,
                 "output": response,
             }
-
     def _build_session_context(self, memory_context: str, last_feedback: str) -> str:
         sections = []
         if memory_context.strip():
             sections.append(f"=== ПРОВЕРЕННЫЙ ОПЫТ ИЗ БАЗЫ НАВЫКОВ ===\n{memory_context.strip()}")
 
-        if self.session_working_commands:
-            working_list = "\n".join(f"- {c[:140]}" for c in self.session_working_commands[-8:])
+        if self.session_discovered_urls:
+            urls_list = "\n".join(f"- {u}" for u in self.session_discovered_urls[-25:])
             sections.append(
-                "=== КОМАНДЫ, УЖЕ ДАВШИЕ НЕНУЛЕВОЙ ВЫВОД В ЭТОЙ СЕССИИ ===\n"
-                f"{working_list}"
+                "=== УЖЕ НАЙДЕННЫЕ В ЭТОЙ СЕССИИ РЕАЛЬНЫЕ URL (ПРОДОЛЖАЙ ПАРСИНГ С НИХ!) ===\n"
+                f"{urls_list}"
+            )
+
+        if self.session_extracted_facts:
+            facts_blob = "\n---\n".join(self.session_extracted_facts[-3:])
+            sections.append(
+                "=== УЖЕ ИЗВЛЕЧЁННЫЕ СО СТРАНИЦ ДАННЫЕ ТЕКУЩЕЙ СЕССИИ ===\n"
+                f"{facts_blob[:3000]}"
             )
 
         if self.session_failed_attempts:
             failed_list = "\n".join(f"- ⛔ {f}" for f in self.session_failed_attempts[-15:])
             sections.append(
                 "=== НЕУДАЧНЫЕ ПОПЫТКИ ТЕКУЩЕЙ ЗАДАЧИ (ПОВТОРЯТЬ ЗАПРЕЩЕНО!) ===\n"
-                f"{failed_list}\n"
-                "ОБЯЗАТЕЛЬНО выбери другой источник, другой домен или другой инструмент!"
+                f"{failed_list}"
             )
 
         if last_feedback.strip():
@@ -255,11 +289,19 @@ class BatchOrchestrator:
             f"Подзадача #{r['subtask_id']} ({r['description']}) [Роль: {r['role']}]:\n{r['output']}"
             for r in results
         )
+        blackboard_facts = ""
+        if self.session_extracted_facts:
+            blackboard_facts = (
+                "\n\n=== СЫРЫЕ ИЗВЛЕЧЁННЫЕ ДАННЫЕ С РЕАЛЬНЫХ СТРАНИЦ ===\n"
+                + "\n---\n".join(self.session_extracted_facts[-3:])[:3500]
+            )
+
         prompt = (
             f"Главная задача пользователя: {main_task}\n\n"
-            f"Ниже приведены отчёты агентов:\n{grouped}\n\n"
-            f"ЖЁСТКОЕ ТРЕБОВАНИЕ: Отбрось все неудачные попытки, ошибки доступа, догадки и советы 'сделайте сами'. "
-            f"Собери в финальный ответ ТОЛЬКО реальные фактические данные, напрямую решающие главную задачу."
+            f"Отчёты агентов:\n{grouped}"
+            f"{blackboard_facts}\n\n"
+            f"ЖЁСТКОЕ ТРЕБОВАНИЕ: Отбрось все неудачные попытки, ошибки 404 и советы 'сделайте сами'. "
+            f"Используя реальные данные из отчётов и извлечённых страниц, сформируй точный, полный фактический ответ."
         )
         return await self.client.generate(
             model=self.executor_model,
@@ -311,9 +353,11 @@ class BatchOrchestrator:
         synthesized_solution = ""
         fast_verified = False
 
-        # Сброс временной памяти текущей задачи
+        # Сброс оперативной доски текущей задачи
         self.session_working_commands = []
         self.session_failed_attempts = []
+        self.session_discovered_urls = []
+        self.session_extracted_facts = []
         print(f"[Workspace] Изолированная папка сессии: {self.workspace_dir}")
 
         memory_context = ""
@@ -325,7 +369,6 @@ class BatchOrchestrator:
         except Exception as e:
             print(f"[Memory WARN] Поиск в памяти пропущен: {e}")
 
-        # ЭТАП 1: Поиск решения без переключения VRAM с накоплением временного журнала ошибок
         for iteration in range(1, self.max_iterations + 1):
             synthesized_solution = await self._execute_iteration_pipeline(
                 task_text=task_text,
@@ -357,13 +400,12 @@ class BatchOrchestrator:
             last_feedback = (
                 f"Причина отклонения (итерация {iteration}): {critique_feedback}\n"
                 f"Тупиковый путь: {dead_end or 'не указан'}\n"
-                f"Что сделать по-другому: {next_strategy or 'найти другой источник/инструмент'}"
+                f"Что сделать по-другому: {next_strategy or 'распарсить внутренние разделы найденных URL'}"
             ).strip()
             print(f"[RETRY] Критик отклонил ответ: {critique_feedback}")
             if next_strategy:
                 print(f"[SEARCH ALT] Новый вектор поиска: {next_strategy}")
 
-        # ЭТАП 2: Финальный глубокий аудит (1 загрузка critic_model в самом конце)
         if fast_verified:
             self._check_cancelled()
             if self.critic_model and self.critic_model != self.executor_model:
@@ -397,7 +439,6 @@ class BatchOrchestrator:
                 else:
                     print(f"[SUCCESS] Финальный аудитор утвердил решение: {final_feedback}")
 
-        # В постоянную память и навыки сохраняем ТОЛЬКО подтверждённый успех
         if fast_verified:
             try:
                 await self.memory.save(
@@ -410,13 +451,16 @@ class BatchOrchestrator:
             except Exception as e:
                 print(f"[Memory WARN] Не удалось сохранить опыт: {e}")
 
-            # Очищаем временный журнал ошибок сессии
             self.session_failed_attempts.clear()
+            self.session_discovered_urls.clear()
+            self.session_extracted_facts.clear()
             return synthesized_solution
 
-        print("[FAILED] Задача не решена. Временный журнал ошибок очищен, постоянная память не засорена.")
+        print("[FAILED] Задача не решена. Временный буфер сессии очищен, постоянная память не засорена.")
         failed_summary = "\n".join(f"- ⛔ {item}" for item in self.session_failed_attempts[-8:])
         self.session_failed_attempts.clear()
+        self.session_discovered_urls.clear()
+        self.session_extracted_facts.clear()
 
         return (
             f"## Статус: Задача не выполнена за {self.max_iterations} итераций\n\n"
@@ -426,3 +470,4 @@ class BatchOrchestrator:
 
 
 Orchestrator = BatchOrchestrator
+
