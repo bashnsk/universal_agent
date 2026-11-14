@@ -1,18 +1,16 @@
 ollama:
-  base_url: "http://127.0.0.1:11434"
+  base_url: "http://localhost:11434"
+  default_model: "qwen2.5-coder:14b"
+  critic_model: "deepseek-r1:14b"
+  embed_model: "nomic-embed-text:latest"
   timeout: 300
-  max_concurrent_requests: 4  # Соответствует OLLAMA_NUM_PARALLEL
-  keep_alive: "10m"           # Держим текущую модель в VRAM на время всей фазы
-
-models:
-  planner: "qwen2.5-coder:14b"
-  executor: "qwen2.5-coder:14b"
-  critic: "deepseek-r1:14b"   # Загрузится только ПОСЛЕ завершения всех задач executor
-  embedder: "nomic-embed-text:latest"
+  max_concurrent_requests: 4
+  keep_alive: "10m"
 
 execution:
-  max_iterations: 5           # Максимум глобальных циклов доработки после критика
-  context_window: 8192        # Оптимальный размер окна для 4 параллельных слотов в 16 ГБ
+  max_iterations: 5
+  multi_role_count: 3
+  context_window: 8192
   roles:
     - name: "Senior_Developer"
       temperature: 0.2
@@ -25,7 +23,6 @@ execution:
       system_prompt: "Ты инженер по тестированию и безопасности. Ищи уязвимости, ошибки парсинга и сбои окружения."
 
 paths:
-  workspace_root: "storage/workspace"
-  tasks_archive: "storage/tasks"
-  skills_dir: "skills"
-  memory_db: "storage/memory/vector_store.db"
+  workspace_root: "/home/sid/RAID/_AI/universal_agent/storage/workspace"
+  tasks_archive: "/home/sid/RAID/_AI/universal_agent/storage/tasks"
+  skills_registry: "/home/sid/RAID/_AI/universal_agent/skills/registry.json"
