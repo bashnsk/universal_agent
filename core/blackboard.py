@@ -29,7 +29,7 @@ class SessionBlackboard:
             return ""
         if "://" not in raw:
             raw = "https://" + raw
-        host = urlparse(raw).netloc.split(":")
+        host = urlparse(raw).netloc.split(":")[0]
         return host[4:] if host.startswith("www.") else host
 
     def block_domain(self, domain_or_url: str) -> None:
@@ -67,7 +67,7 @@ class SessionBlackboard:
         if "[EXIT CODE]: 0" not in shell_out or "[STDOUT]:" not in shell_out:
             return False, "ошибка выполнения или пустой вывод"
 
-        stdout_part = shell_out.split("[STDOUT]:", 1).strip()
+        stdout_part = shell_out.split("[STDOUT]:", 1)[1].strip()
         if len(stdout_part) < 25:
             return False, "слишком короткий ответ"
 
