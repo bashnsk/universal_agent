@@ -25,6 +25,7 @@ class BatchOrchestrator:
         self.cfg = config
         self._cancelled = False
         self._active_tasks: List[asyncio.Task] = []
+        self.executed_commands: List[str] = []
 
         ollama_cfg = config.get("ollama", {})
         exec_cfg = config.get("execution", {})
@@ -81,12 +82,17 @@ class BatchOrchestrator:
         self.planner = TaskPlanner(self.client, self.executor_model)
         self.critic = CriticAgent(self.client, self.critic_model)
 
-        skills_path = paths_cfg.get(
-            "skills_registry",
-            "/home/sid/RAID/_AI/universal_agent/skills/registry.json",
+        memory_path = paths_cfg.get(
+            "memory_path",
+            "/home/sid/RAID/_AI/universal_agent/storage/memory/vector_memory.json",
+        )
+        skills_dir = paths_cfg.get(
+            "skills_dir",
+            "/home/sid/RAID/_AI/universal_agent/skills",
         )
         self.memory = AgentMemory(
-            storage_path=skills_path,
+            storage_path=memory_path,
+            skills_dir=skills_dir,
             base_url=self.base_url,
             embed_model=self.embed_model,
         )
@@ -136,6 +142,8 @@ class BatchOrchestrator:
                 cmd = bash_match.group(1).strip()
                 print(f"  [Shell #{job.subtask_id}:{job.role_name}] Выполнение: {cmd[:90]}...")
                 shell_out = await ShellTool.run(cmd, workspace_dir=str(self.workspace_dir))
+                if "[EXIT CODE]: 0" in shell_out:
+                    self.executed_commands.append(cmd)
 
                 followup_prompt = (
                     f"Ты запросил выполнение команды:\n{cmd}\n\n"
@@ -181,16 +189,17 @@ class BatchOrchestrator:
     async def run(self, task_text: str) -> str:
         feedback = ""
         synthesized_solution = ""
+        self.executed_commands = []
         print(f"[Workspace] Изолированная папка сессии: {self.workspace_dir}")
 
         memory_context = ""
-        if hasattr(self.memory, "search"):
-            try:
-                past = await self.memory.search(task_text)
-                if past:
-                    memory_context = f"Релевантный прошлый опыт:\n{past}\n"
-            except Exception as e:
-                print(f"[Memory WARN] Поиск в памяти пропущен: {e}")
+        try:
+            past = await self.memory.search(task_text)
+            if past:
+                print("[Memory] Найдены релевантные решения из прошлого опыта!")
+                memory_context = f"Релевантный прошлый опыт:\n{past}\n"
+        except Exception as e:
+            print(f"[Memory WARN] Поиск в памяти пропущен: {e}")
 
         for iteration in range(1, self.max_iterations + 1):
             self._check_cancelled()
@@ -231,11 +240,15 @@ class BatchOrchestrator:
 
             if status == "SUCCESS":
                 print(f"[SUCCESS] Критик утвердил решение: {critique_feedback}")
-                if hasattr(self.memory, "save"):
-                    try:
-                        await self.memory.save(task_text, synthesized_solution)
-                    except Exception as e:
-                        print(f"[Memory WARN] Не удалось сохранить опыт: {e}")
+                try:
+                    await self.memory.save(
+                        task_text,
+                        synthesized_solution,
+                        executed_commands=self.executed_commands,
+                    )
+                    print("[Memory] Опыт и рабочие команды сохранены в память и реестр навыков.")
+                except Exception as e:
+                    print(f"[Memory WARN] Не удалось сохранить опыт: {e}")
                 return synthesized_solution
 
             feedback = f"Замечания критика (итерация {iteration}): {critique_feedback}"
