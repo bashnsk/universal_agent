@@ -93,6 +93,31 @@
         .btn-stop { background: #dc2626 !important; }
         .btn-stop:hover { background: #ef4444 !important; }
         .btn-stop:disabled { background: #475569 !important; }
+        .viewer-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            margin-top: 22px;
+            margin-bottom: 10px;
+        }
+        .viewer-header h3 {
+            margin: 0;
+            min-width: 0;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .btn-live {
+            flex: 0 0 auto;
+            padding: 7px 14px;
+            font-size: 13px;
+            background: #0d9488;
+            border-radius: 6px;
+            white-space: nowrap;
+        }
+        .btn-live:hover { background: #14b8a6; }
+        .btn-live.hidden { display: none; }
         .tab-bar {
             display: flex;
             gap: 6px;
@@ -201,7 +226,10 @@
                 <button id="stopBtn" class="btn-stop" onclick="stopTask()" disabled>Остановить</button>
             </div>
 
-            <h3 id="viewerTitle" style="margin-top: 22px;">Лог выполнения в реальном времени (SSE):</h3>
+            <div class="viewer-header">
+                <h3 id="viewerTitle">Лог выполнения в реальном времени (SSE):</h3>
+                <button id="liveLogBtn" class="btn-live hidden" onclick="returnToLiveLog()">📡 Вернуться к Live-логу</button>
+            </div>
             <pre id="logOutput">Ожидание задачи...</pre>
         </div>
     </div>
@@ -332,9 +360,20 @@
             }
         }
 
-        async function loadTaskResult(filename) {
+        function enterArchiveView(titleText) {
             if (eventSource) eventSource.close();
-            document.getElementById("viewerTitle").textContent = `Просмотр задачи: ${filename}`;
+            document.getElementById("viewerTitle").textContent = titleText;
+            document.getElementById("liveLogBtn").classList.remove("hidden");
+        }
+
+        function returnToLiveLog() {
+            document.getElementById("viewerTitle").textContent = "Лог выполнения в реальном времени (SSE):";
+            document.getElementById("liveLogBtn").classList.add("hidden");
+            connectSSE();
+        }
+
+        async function loadTaskResult(filename) {
+            enterArchiveView(`Просмотр задачи: ${filename}`);
             const res = await fetch(`/api/task/${filename}`);
             const data = await res.json();
             const logEl = document.getElementById("logOutput");
@@ -344,8 +383,7 @@
 
         async function loadSkillDetail(filename) {
             if (!filename) return;
-            if (eventSource) eventSource.close();
-            document.getElementById("viewerTitle").textContent = `Навык: ${filename}`;
+            enterArchiveView(`Навык: ${filename}`);
             const res = await fetch(`/api/skill/${filename}`);
             const data = await res.json();
             const logEl = document.getElementById("logOutput");
@@ -366,8 +404,7 @@
         function showMemoryDetail(index) {
             const item = cachedMemory[index];
             if (!item) return;
-            if (eventSource) eventSource.close();
-            document.getElementById("viewerTitle").textContent = `Запись памяти (${item.timestamp || '-'})`;
+            enterArchiveView(`Запись памяти (${item.timestamp || '-'})`);
             const logEl = document.getElementById("logOutput");
             logEl.textContent =
                 `Задача: ${item.task || '-'}\n` +
@@ -416,6 +453,7 @@
             }
             setRunningState(true);
             document.getElementById("viewerTitle").textContent = "Лог выполнения в реальном времени (SSE):";
+            document.getElementById("liveLogBtn").classList.add("hidden");
             document.getElementById("logOutput").textContent = "Отправка задачи...";
 
             const res = await fetch('/api/run', {
