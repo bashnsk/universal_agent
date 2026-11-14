@@ -151,20 +151,31 @@ def _search_brave(query: str, max_results: int, api_key: str) -> list[dict]:
 def _search_ddgs_lib(query: str, max_results: int) -> list[dict]:
     results = []
     seen_urls = set()
-    raw_items = DDGS().text(query, region="ru-ru", safesearch="off", max_results=max_results + 4)
-    for item in raw_items:
-        url = item.get("href", "").strip()
-        if not _is_valid_result(url, seen_urls):
+
+    for backend in ("lite", "auto"):
+        try:
+            raw_items = list(DDGS().text(query, max_results=max_results + 4, backend=backend))
+        except Exception:
             continue
-        seen_urls.add(url)
-        results.append({
-            "title": " ".join(item.get("title", "").split()),
-            "url": url,
-            "snippet": " ".join(item.get("body", "").split()),
-        })
-        if len(results) >= max_results:
-            break
+
+        for item in raw_items:
+            url = item.get("href", "").strip()
+            if not _is_valid_result(url, seen_urls):
+                continue
+            seen_urls.add(url)
+            results.append({
+                "title": " ".join(item.get("title", "").split()),
+                "url": url,
+                "snippet": " ".join(item.get("body", "").split()),
+            })
+            if len(results) >= max_results:
+                return results
+
+        if results:
+            return results
+
     return results
+
 def _search_ddg_html(query: str, max_results: int) -> list[dict]:
     encoded_q = urllib.parse.quote_plus(query)
     url = f"https://duckduckgo.com{encoded_q}"
