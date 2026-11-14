@@ -1,5 +1,6 @@
 import json
 import re
+from typing import Optional
 from agents.base import OllamaClient
 
 
@@ -26,7 +27,14 @@ class CriticAgent:
                 return f"Обнаружена отписка или заглушка вместо реальных данных ('{marker}')."
         return ""
 
-    async def evaluate(self, main_task: str, accumulated_results: str) -> dict:
+    async def evaluate(
+        self,
+        main_task: str,
+        accumulated_results: str,
+        model_override: Optional[str] = None,
+    ) -> dict:
+        target_model = model_override or self.model
+
         if not accumulated_results or len(accumulated_results.strip()) < 20:
             return {
                 "status": "RETRY",
@@ -61,10 +69,9 @@ class CriticAgent:
         prompt = f"Главная задача пользователя:\n{main_task}\n\nПредставленный ответ на проверку:\n{accumulated_results}"
 
         response = await self.client.generate(
-            self.model, prompt, system_prompt=system, temperature=0.1
+            target_model, prompt, system_prompt=system, temperature=0.1
         )
 
-        # Убираем блоки размышлений <think>...</think> у reasoning-моделей (deepseek-r1)
         clean_response = re.sub(r"<think>.*?</think>", "", response, flags=re.DOTALL).strip()
 
         for candidate in (clean_response, response):

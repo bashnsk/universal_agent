@@ -103,7 +103,6 @@ class BatchOrchestrator:
             embed_model=self.embed_model,
         )
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
-
     def _rotate_workspaces(self, keep_last: int = 15) -> None:
         if keep_last < 1 or not self.workspace_base.exists():
             return
@@ -132,6 +131,7 @@ class BatchOrchestrator:
     def _check_cancelled(self):
         if self._cancelled:
             raise asyncio.CancelledError("Задача отменена пользователем.")
+
     async def _run_single_job(self, job: SubtaskJob, context_hint: str) -> Dict[str, Any]:
         async with self.semaphore:
             self._check_cancelled()
@@ -197,7 +197,6 @@ class BatchOrchestrator:
                 "role": job.role_name,
                 "output": response,
             }
-
     async def _synthesize_results(self, main_task: str, results: List[Dict[str, Any]]) -> str:
         self._check_cancelled()
         grouped = "\n---\n".join(
@@ -218,10 +217,58 @@ class BatchOrchestrator:
             num_ctx=self.context_window,
         )
 
+    async def _execute_iteration_pipeline(
+        self,
+        task_text: str,
+        iteration_label: str,
+        memory_context: str,
+        dead_ends: List[str],
+        last_feedback: str,
+    ) -> str:
+        self._check_cancelled()
+        print(f"\n=== {iteration_label} | Фаза 1: Планирование ({self.executor_model}) ===")
+
+        dead_ends_block = ""
+        if dead_ends:
+            formatted_dead_ends = "\n".join(f"- ЭТИМ ПУТЁМ ИДТИ НЕ НАДО: {d}" for d in dead_ends)
+            dead_ends_block = (
+                "\n⛔ ТУПИКОВЫЕ ПУТИ ТЕКУЩЕЙ ЗАДАЧИ (ПОВТОРЯТЬ ЗАПРЕЩЕНО):\n"
+                f"{formatted_dead_ends}\n"
+                "Построй новый план, использующий принципиально иные источники или методы!\n"
+            )
+
+        full_context = f"{memory_context}\n{dead_ends_block}\n{last_feedback}".strip()
+        subtasks = await self.planner.decompose(task_text, context=full_context)
+        print(f"[+] Сформировано подзадач: {len(subtasks)}")
+
+        job_queue: List[SubtaskJob] = []
+        for idx, sub in enumerate(subtasks, start=1):
+            for role in self.active_roles:
+                job_queue.append(
+                    SubtaskJob(
+                        subtask_id=idx,
+                        description=sub,
+                        role_name=role["name"],
+                        system_prompt=role["system_prompt"],
+                        temperature=role["temperature"],
+                    )
+                )
+
+        print(f"=== Фаза 2: Очередь из {len(job_queue)} сессий на модели {self.executor_model} ===")
+        self._active_tasks = [
+            asyncio.create_task(self._run_single_job(job, full_context))
+            for job in job_queue
+        ]
+        raw_results = await asyncio.gather(*self._active_tasks)
+        self._active_tasks.clear()
+
+        print(f"=== Фаза 3: Синтез результатов на модели {self.executor_model} ===")
+        return await self._synthesize_results(task_text, raw_results)
     async def run(self, task_text: str) -> str:
         dead_ends: List[str] = []
         last_feedback = ""
         synthesized_solution = ""
+        fast_verified = False
         self.executed_commands = []
         self.all_attempted_commands = []
         print(f"[Workspace] Изолированная папка сессии: {self.workspace_dir}")
@@ -236,48 +283,20 @@ class BatchOrchestrator:
             print(f"[Memory WARN] Поиск в памяти пропущен: {e}")
 
         for iteration in range(1, self.max_iterations + 1):
-            self._check_cancelled()
-            print(f"\n=== Итерация {iteration}/{self.max_iterations} | Фаза 1: Планирование ({self.executor_model}) ===")
+            synthesized_solution = await self._execute_iteration_pipeline(
+                task_text=task_text,
+                iteration_label=f"Итерация {iteration}/{self.max_iterations}",
+                memory_context=memory_context,
+                dead_ends=dead_ends,
+                last_feedback=last_feedback,
+            )
 
-            dead_ends_block = ""
-            if dead_ends:
-                formatted_dead_ends = "\n".join(f"- ЭТИМ ПУТЁМ ИДТИ НЕ НАДО: {d}" for d in dead_ends)
-                dead_ends_block = (
-                    "\n⛔ ТУПИКОВЫЕ ПУТИ ТЕКУЩЕЙ ЗАДАЧИ (ПОВТОРЯТЬ ЗАПРЕЩЕНО):\n"
-                    f"{formatted_dead_ends}\n"
-                    "Построй новый план, использующий принципиально иные источники или методы!\n"
-                )
-
-            full_context = f"{memory_context}\n{dead_ends_block}\n{last_feedback}".strip()
-            subtasks = await self.planner.decompose(task_text, context=full_context)
-            print(f"[+] Сформировано подзадач: {len(subtasks)}")
-
-            job_queue: List[SubtaskJob] = []
-            for idx, sub in enumerate(subtasks, start=1):
-                for role in self.active_roles:
-                    job_queue.append(
-                        SubtaskJob(
-                            subtask_id=idx,
-                            description=sub,
-                            role_name=role["name"],
-                            system_prompt=role["system_prompt"],
-                            temperature=role["temperature"],
-                        )
-                    )
-
-            print(f"=== Фаза 2: Очередь из {len(job_queue)} сессий на модели {self.executor_model} ===")
-            self._active_tasks = [
-                asyncio.create_task(self._run_single_job(job, full_context))
-                for job in job_queue
-            ]
-            raw_results = await asyncio.gather(*self._active_tasks)
-            self._active_tasks.clear()
-
-            print(f"=== Фаза 3: Синтез результатов на модели {self.executor_model} ===")
-            synthesized_solution = await self._synthesize_results(task_text, raw_results)
-
-            print(f"=== Фаза 4: Жёсткий аудит критиком ({self.critic_model}) ===")
-            verdict = await self.critic.evaluate(task_text, synthesized_solution)
+            print(f"=== Фаза 4.1: Быстрый аудит без смены VRAM ({self.executor_model}) ===")
+            verdict = await self.critic.evaluate(
+                task_text,
+                synthesized_solution,
+                model_override=self.executor_model,
+            )
 
             status = str(verdict.get("status", "RETRY")).upper()
             critique_feedback = str(verdict.get("feedback", "Не получены фактические данные.")).strip()
@@ -285,18 +304,9 @@ class BatchOrchestrator:
             next_strategy = str(verdict.get("next_strategy", "")).strip()
 
             if status == "SUCCESS":
-                print(f"[SUCCESS] Критик подтвердил наличие фактических данных: {critique_feedback}")
-                try:
-                    await self.memory.save(
-                        task_text,
-                        synthesized_solution,
-                        executed_commands=self.executed_commands,
-                        is_success=True,
-                    )
-                    print("[Memory] Успешное решение и проверенный навык сохранены.")
-                except Exception as e:
-                    print(f"[Memory WARN] Не удалось сохранить опыт: {e}")
-                return synthesized_solution
+                print(f"[FAST-PASS] Предварительная проверка пройдена: {critique_feedback}")
+                fast_verified = True
+                break
 
             recorded_dead_end = dead_end or critique_feedback
             if recorded_dead_end not in dead_ends:
@@ -306,15 +316,60 @@ class BatchOrchestrator:
                 f"Замечание критика (итерация {iteration}): {critique_feedback}\n"
                 f"Рекомендуемый альтернативный вектор: {next_strategy}"
             ).strip()
-            print(f"[RETRY] Критик отклонил ответ: {critique_feedback}")
+            print(f"[RETRY] Быстрый критик отклонил ответ: {critique_feedback}")
             if next_strategy:
                 print(f"[SEARCH ALT] Новый вектор поиска: {next_strategy}")
 
-        # Если все итерации исчерпаны, но задача НЕ решена:
-        # 1. Не сохраняем провал в навыки (skills/).
-        # 2. Фиксируем в векторной памяти анти-паттерн, чтобы будущие запуски обходили эти тупики.
+        if fast_verified:
+            self._check_cancelled()
+            if self.critic_model and self.critic_model != self.executor_model:
+                print(f"\n=== Фаза 4.2: Финальный глубокий аудит ({self.critic_model}) ===")
+                final_verdict = await self.critic.evaluate(
+                    task_text,
+                    synthesized_solution,
+                    model_override=self.critic_model,
+                )
+                final_status = str(final_verdict.get("status", "RETRY")).upper()
+                final_feedback = str(final_verdict.get("feedback", "")).strip()
+
+                if final_status != "SUCCESS":
+                    print(f"[FINAL-CRITIC REJECT] Глубокий аудит выявил недочёт: {final_feedback}")
+                    dead_end = str(final_verdict.get("dead_end", "")).strip() or final_feedback
+                    if dead_end not in dead_ends:
+                        dead_ends.append(dead_end)
+
+                    synthesized_solution = await self._execute_iteration_pipeline(
+                        task_text=task_text,
+                        iteration_label="Финальная доработка после глубокого аудита",
+                        memory_context=memory_context,
+                        dead_ends=dead_ends,
+                        last_feedback=f"Замечания финального аудитора: {final_feedback}",
+                    )
+                    recheck = await self.critic.evaluate(
+                        task_text,
+                        synthesized_solution,
+                        model_override=self.executor_model,
+                    )
+                    if str(recheck.get("status", "RETRY")).upper() != "SUCCESS":
+                        fast_verified = False
+                else:
+                    print(f"[SUCCESS] Финальный аудитор утвердил решение: {final_feedback}")
+
+        if fast_verified:
+            try:
+                await self.memory.save(
+                    task_text,
+                    synthesized_solution,
+                    executed_commands=self.executed_commands,
+                    is_success=True,
+                )
+                print("[Memory] Успешное решение и проверенный навык сохранены.")
+            except Exception as e:
+                print(f"[Memory WARN] Не удалось сохранить опыт: {e}")
+            return synthesized_solution
+
         final_failure_reason = "; ".join(dead_ends[-3:]) if dead_ends else "Задача не решена за отведённые итерации."
-        print(f"[FAILED] Задача не выполнена. Фиксируем тупиковый путь в памяти как анти-паттерн.")
+        print("[FAILED] Задача не выполнена. Фиксируем тупиковый путь в памяти как анти-паттерн.")
         try:
             await self.memory.save(
                 task_text,
