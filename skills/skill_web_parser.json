@@ -1,0 +1,10 @@
+{
+  "id": "skill_web_parser",
+  "created_at": "2026-11-14T23:45:00",
+  "task_pattern": "Парсинг и извлечение данных, списков, новостей или ссылок с любых веб-страниц через Python и BeautifulSoup",
+  "commands": [
+    "python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"https://example.com\"",
+    "python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"https://example.com\" --query \"ключевое_слово\""
+  ],
+  "summary": "Готовый универсальный CLI-парсер на Python + BeautifulSoup. Очищает HTML от скриптов и стилей, извлекает заголовки, списки, таблицы и релевантные ссылки."
+}
