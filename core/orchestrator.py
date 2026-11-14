@@ -1,5 +1,6 @@
 import asyncio
 import re
+import shutil
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
@@ -42,15 +43,19 @@ class BatchOrchestrator:
         self.max_iterations = int(exec_cfg.get("max_iterations", 5))
         self.multi_role_count = int(exec_cfg.get("multi_role_count", 3))
         self.context_window = int(exec_cfg.get("context_window", 8192))
+        self.max_workspace_sessions = int(exec_cfg.get("max_workspace_sessions", 15))
 
-        workspace_base = Path(
+        self.workspace_base = Path(
             paths_cfg.get(
                 "workspace_root",
                 "/home/sid/RAID/_AI/universal_agent/storage/workspace",
             )
         )
+        self.workspace_base.mkdir(parents=True, exist_ok=True)
+        self._rotate_workspaces(keep_last=self.max_workspace_sessions)
+
         session_id = datetime.now().strftime("session_%Y%m%d_%H%M%S")
-        self.workspace_dir = workspace_base / session_id
+        self.workspace_dir = self.workspace_base / session_id
         self.workspace_dir.mkdir(parents=True, exist_ok=True)
 
         default_roles = [
@@ -62,12 +67,12 @@ class BatchOrchestrator:
             {
                 "name": "System_Architect",
                 "temperature": 0.3,
-                "system_prompt": "Ты системный архитектор Linux/DevOps. Проверяй источники данных, сети и зависимости.",
+                "system_prompt": "Ты системный архитектор Linux/DevOps. Проверяй реальные домены, HTML-страницы и источники данных через curl/python3.",
             },
             {
                 "name": "EdgeCase_Tester",
                 "temperature": 0.4,
-                "system_prompt": "Ты инженер по проверке фактов и тестированию. Никогда не выдумывай данные, проверяй их через инструменты.",
+                "system_prompt": "Ты инженер по проверке фактов и тестированию. Никогда не выдумывай URL или данные, проверяй их через инструменты.",
             },
         ]
         all_roles = exec_cfg.get("roles", default_roles)
@@ -98,6 +103,25 @@ class BatchOrchestrator:
         )
         self.semaphore = asyncio.Semaphore(self.max_concurrent)
 
+    def _rotate_workspaces(self, keep_last: int = 15) -> None:
+        if keep_last < 1 or not self.workspace_base.exists():
+            return
+        sessions = sorted(
+            [
+                p for p in self.workspace_base.iterdir()
+                if p.is_dir() and p.name.startswith("session_")
+            ],
+            key=lambda p: p.name,
+        )
+        excess = len(sessions) - keep_last
+        if excess > 0:
+            for old_dir in sessions[:excess]:
+                try:
+                    shutil.rmtree(old_dir, ignore_errors=True)
+                except Exception:
+                    pass
+            print(f"[Workspace] Ротация: удалено старых сессий: {excess}")
+
     def cancel(self):
         self._cancelled = True
         for t in self._active_tasks:
@@ -113,10 +137,15 @@ class BatchOrchestrator:
             print(f"[Queue -> GPU] Подзадача #{job.subtask_id} | Роль: {job.role_name}")
 
             tool_instruction = (
-                "У тебя есть доступ к bash-песочнице Linux (с выходом в интернет, curl, python3). "
-                "Если для точного ответа нужны реальные данные из интернета или системы (никогда не выдумывай факты!), "
-                "выведи команду строго внутри тегов <bash>команда</bash> и больше ничего не пиши. "
-                "Если данные уже есть или команда не нужна — сразу дай готовый структурированный ответ."
+                "У тебя есть доступ к bash-песочнице Linux (с выходом в интернет, curl, python3).\n"
+                "ЖЁСТКИЕ ПРАВИЛА РАБОТЫ С ИНСТРУМЕНТАМИ:\n"
+                "1. Никогда не выдумывай несуществующие API-адреса или домены (например, не угадывай /v2/hits).\n"
+                "2. Если нужно получить данные из интернета, сначала проверь реальный официальный сайт через curl -sL с User-Agent "
+                "или найди точный URL через HTML-поиск на Python, затем распарси реальную страницу.\n"
+                "3. Если команда вернула ошибку DNS, 403 или 404 — НЕ сдавайся и НЕ пиши пользователю инструкцию по диагностике сети. "
+                "Вместо этого в следующем <bash>...</bash> проверь другой домен (например, .ru вместо .com) или другой способ парсинга.\n"
+                "4. Для вызова команды выведи строго тег <bash>команда</bash> и больше ничего. "
+                "Когда реальные факты получены — дай чёткий итоговый ответ."
             )
 
             prompt = (
@@ -133,23 +162,24 @@ class BatchOrchestrator:
                 num_ctx=self.context_window,
             )
 
-            for step in range(1, 3):
+            for step in range(1, 5):
                 bash_match = re.search(r"<bash>(.*?)</bash>", response, re.DOTALL)
                 if not bash_match:
                     break
 
                 self._check_cancelled()
                 cmd = bash_match.group(1).strip()
-                print(f"  [Shell #{job.subtask_id}:{job.role_name}] Выполнение: {cmd[:90]}...")
+                print(f"  [Shell #{job.subtask_id}:{job.role_name}] Шаг {step}: {cmd[:90]}...")
                 shell_out = await ShellTool.run(cmd, workspace_dir=str(self.workspace_dir))
-                if "[EXIT CODE]: 0" in shell_out:
+                if "[EXIT CODE]: 0" in shell_out and "[STDOUT]:" in shell_out:
                     self.executed_commands.append(cmd)
 
                 followup_prompt = (
                     f"Ты запросил выполнение команды:\n{cmd}\n\n"
                     f"Результат выполнения из песочницы:\n{shell_out}\n\n"
-                    f"На основе этих реальных данных заверши свою подзадачу: {job.description}\n"
-                    f"(Если нужна ещё одна уточняющая команда — используй <bash>...</bash>, иначе дай итоговый ответ)."
+                    f"Проанализируй вывод. Если данных ещё недостаточно или возникла ошибка (DNS/404/пустой вывод), "
+                    f"выполни следующую команду через <bash>...</bash> с исправленным URL или парсером. "
+                    f"Если нужные данные получены — дай полный финальный ответ по подзадаче: {job.description}"
                 )
                 response = await self.client.generate(
                     model=self.executor_model,
@@ -174,14 +204,15 @@ class BatchOrchestrator:
         )
         prompt = (
             f"Главная задача: {main_task}\n\n"
-            f"Ниже приведены решения подзадач от разных ролей (включая данные, полученные из интернета и терминала). "
-            f"Сравни их, отбрось выдумки и ошибочные варианты, объедини проверенные факты и сформируй итоговый ответ:\n\n"
+            f"Ниже приведены решения подзадач от разных ролей (включая реальные данные из терминала и сети). "
+            f"Отбрось предположения, ошибки DNS и отписки. Используй только подтверждённые факты "
+            f"и сформируй точный, полезный итоговый ответ на запрос пользователя:\n\n"
             f"{grouped}"
         )
         return await self.client.generate(
             model=self.executor_model,
             prompt=prompt,
-            system_prompt="Ты технический лидер. Собери единый, точный и полный финальный ответ без воды.",
+            system_prompt="Ты технический лидер. Собери единый, точный и полный финальный ответ по существу задачи.",
             temperature=0.1,
             num_ctx=self.context_window,
         )
