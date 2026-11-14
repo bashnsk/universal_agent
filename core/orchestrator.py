@@ -157,15 +157,14 @@ class BatchOrchestrator:
             print(f"[Queue -> GPU] Подзадача #{job.subtask_id} | Роль: {job.role_name}")
 
             tool_instruction = (
-                "У тебя есть доступ к bash-песочнице Linux (curl, python3, системные утилиты).\n"
-                "УНИВЕРСАЛЬНЫЕ ПРАВИЛА ПОИСКА РЕШЕНИЙ:\n"
-                "1. Строго держись сути исходной задачи пользователя. Не уходи в посторонние темы.\n"
-                "2. Запрещено выдумывать несуществующие URL, API и данные. Если нужен веб-источник или файл — "
-                "сначала найди реальный рабочий адрес/путь через поиск или проверку HTML, затем извлеки данные.\n"
-                "3. ВНИМАТЕЛЬНО изучи блок 'НЕУДАЧНЫЕ ПОПЫТКИ ТЕКУЩЕЙ ЗАДАЧИ' в контексте: "
-                "категорически запрещено повторять команды, домены и методы, которые уже дали ошибку!\n"
-                "4. Запрещено перекладывать задачу на пользователя (не пиши 'сделайте сами' или 'получите ключ').\n"
-                "5. Для вызова команды выведи строго <bash>команда</bash> без пояснений. "
+                "У тебя есть доступ к bash-песочнице Linux и готовым Python-инструментам:\n"
+                "- Поиск ссылок в интернете: python3 /home/sid/RAID/_AI/universal_agent/skills/web_search.py \"запрос\" --limit 5\n"
+                "- Парсинг любой страницы (BeautifulSoup): python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"https://url\"\n\n"
+                "УНИВЕРСАЛЬНЫЕ ПРАВИЛА:\n"
+                "1. Для поиска в сети ВСЕГДА используй web_search.py, а для чтения страниц — web_parser.py. "
+                "ЗАПРЕЩЕНО делать прямой curl к ://google.com и выдумывать URL-заглушки.\n"
+                "2. Никогда не повторяй команды из блока 'НЕУДАЧНЫЕ ПОПЫТКИ ТЕКУЩЕЙ ЗАДАЧИ'.\n"
+                "3. Для запуска команды выведи строго <bash>команда</bash> без лишнего текста. "
                 "Когда реальные факты получены — дай чёткий итоговый ответ."
             )
 
@@ -183,15 +182,20 @@ class BatchOrchestrator:
                 num_ctx=self.context_window,
             )
 
-            for step in range(1, 5):
+            for step in range(1, 3):
                 bash_match = re.search(r"<bash>(.*?)</bash>", response, re.DOTALL)
                 if not bash_match:
                     break
 
                 self._check_cancelled()
                 cmd = bash_match.group(1).strip()
+                self.all_attempted_commands.append(cmd)
                 print(f"  [Shell #{job.subtask_id}:{job.role_name}] Шаг {step}: {cmd[:90]}...")
-                shell_out = await ShellTool.run(cmd, workspace_dir=str(self.workspace_dir))
+                shell_out = await ShellTool.run(
+                    cmd,
+                    workspace_dir=str(self.workspace_dir),
+                    timeout=20.0,
+                )
 
                 is_ok, fail_reason = self._is_command_output_useful(shell_out)
                 if is_ok:
@@ -203,9 +207,8 @@ class BatchOrchestrator:
                 followup_prompt = (
                     f"Выполнена команда:\n{cmd}\n\n"
                     f"Вывод песочницы:\n{shell_out}\n\n"
-                    f"Оцени результат: если команда вернула ошибку, пустоту или не дала нужных фактов, "
-                    f"НЕ повторяй её — придумай принципиально другой способ через <bash>...</bash>. "
-                    f"Если факты получены — дай точный итоговый ответ по подзадаче: {job.description}"
+                    f"Если получены ссылки через web_search.py — передай нужный реальный URL в web_parser.py через <bash>...</bash>. "
+                    f"Если факты уже получены — дай точный итоговый ответ по подзадаче: {job.description}"
                 )
                 response = await self.client.generate(
                     model=self.executor_model,
@@ -221,6 +224,7 @@ class BatchOrchestrator:
                 "role": job.role_name,
                 "output": response,
             }
+
     def _build_session_context(self, memory_context: str, last_feedback: str) -> str:
         sections = []
         if memory_context.strip():
