@@ -23,8 +23,8 @@
             align-items: stretch;
         }
         .sidebar {
-            width: 320px;
-            min-width: 320px;
+            width: 340px;
+            min-width: 340px;
             flex-shrink: 0;
             background: #1e293b;
             padding: 20px;
@@ -35,7 +35,7 @@
             overflow-y: auto;
             display: flex;
             flex-direction: column;
-            gap: 20px;
+            gap: 18px;
         }
         .content {
             flex: 1 1 auto;
@@ -93,6 +93,28 @@
         .btn-stop { background: #dc2626 !important; }
         .btn-stop:hover { background: #ef4444 !important; }
         .btn-stop:disabled { background: #475569 !important; }
+        .tab-bar {
+            display: flex;
+            gap: 6px;
+            margin-bottom: 12px;
+            width: 100%;
+        }
+        .tab-btn {
+            flex: 1 1 0;
+            min-width: 0;
+            padding: 8px 6px;
+            font-size: 12px;
+            background: #0f172a;
+            color: #94a3b8;
+            border: 1px solid #334155;
+            border-radius: 6px;
+        }
+        .tab-btn:hover { background: #1e293b; color: #f8fafc; }
+        .tab-btn.active {
+            background: #0284c7;
+            color: #ffffff;
+            border-color: #0284c7;
+        }
         pre {
             width: 100%;
             max-width: 100%;
@@ -120,9 +142,15 @@
             border: 1px solid #334155;
             font-size: 13px;
             transition: border 0.2s;
-            word-break: break-all;
+            word-break: break-word;
         }
         .task-item:hover { border-color: #38bdf8; }
+        .item-meta {
+            display: block;
+            font-size: 11px;
+            color: #94a3b8;
+            margin-top: 4px;
+        }
         .config-section { border-top: 1px solid #334155; padding-top: 15px; }
         label { font-size: 13px; color: #94a3b8; }
         @media (max-width: 900px) {
@@ -153,9 +181,13 @@
                 </div>
             </div>
 
-            <div style="flex-grow: 1; overflow-y: auto;">
-                <h3>📁 История задач</h3>
-                <div id="historyList">Загрузка...</div>
+            <div style="flex-grow: 1; display: flex; flex-direction: column; min-height: 0;">
+                <div class="tab-bar">
+                    <button id="tabBtnTasks" class="tab-btn active" onclick="switchTab('tasks')">📁 Задачи</button>
+                    <button id="tabBtnSkills" class="tab-btn" onclick="switchTab('skills')">🧠 Навыки</button>
+                    <button id="tabBtnMemory" class="tab-btn" onclick="switchTab('memory')">🗄 Память</button>
+                </div>
+                <div id="sidebarList" style="flex-grow: 1; overflow-y: auto;">Загрузка...</div>
             </div>
         </div>
 
@@ -169,13 +201,22 @@
                 <button id="stopBtn" class="btn-stop" onclick="stopTask()" disabled>Остановить</button>
             </div>
 
-            <h3 style="margin-top: 22px;">Лог выполнения в реальном времени (SSE):</h3>
+            <h3 id="viewerTitle" style="margin-top: 22px;">Лог выполнения в реальном времени (SSE):</h3>
             <pre id="logOutput">Ожидание задачи...</pre>
         </div>
     </div>
 
     <script>
         let eventSource = null;
+        let currentTab = 'tasks';
+        let cachedMemory = [];
+
+        function escapeHtml(text) {
+            return String(text || '')
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+        }
 
         async function loadConfig() {
             try {
@@ -206,18 +247,36 @@
             alert(result.status === "success" ? "Конфигурация успешно обновлена!" : "Ошибка сохранения");
         }
 
+        function switchTab(tabName) {
+            currentTab = tabName;
+            document.getElementById("tabBtnTasks").classList.toggle("active", tabName === "tasks");
+            document.getElementById("tabBtnSkills").classList.toggle("active", tabName === "skills");
+            document.getElementById("tabBtnMemory").classList.toggle("active", tabName === "memory");
+            refreshSidebar();
+        }
+
+        async function refreshSidebar() {
+            if (currentTab === 'tasks') {
+                await loadHistory();
+            } else if (currentTab === 'skills') {
+                await loadSkills();
+            } else if (currentTab === 'memory') {
+                await loadMemory();
+            }
+        }
+
         async function loadHistory() {
             try {
                 const res = await fetch('/api/tasks');
                 const tasks = await res.json();
-                const listEl = document.getElementById("historyList");
+                const listEl = document.getElementById("sidebarList");
                 if (!tasks || tasks.length === 0) {
                     listEl.innerHTML = "<p style='color: #64748b; font-size: 13px;'>Нет сохраненных задач</p>";
                     return;
                 }
                 listEl.innerHTML = tasks.map(t => `
-                    <div class="task-item" onclick="loadTaskResult('${t}')">
-                        📁 ${t.replace('task_', '').replace('.md', '')}
+                    <div class="task-item" onclick="loadTaskResult('${escapeHtml(t)}')">
+                        📁 ${escapeHtml(t.replace('task_', '').replace('.md', ''))}
                     </div>
                 `).join('');
             } catch (e) {
@@ -225,12 +284,97 @@
             }
         }
 
+        async function loadSkills() {
+            try {
+                const res = await fetch('/api/skills');
+                const skills = await res.json();
+                const listEl = document.getElementById("sidebarList");
+                if (!skills || skills.length === 0) {
+                    listEl.innerHTML = "<p style='color: #64748b; font-size: 13px;'>Навыки пока не сохранены</p>";
+                    return;
+                }
+                listEl.innerHTML = skills.map(s => {
+                    const id = escapeHtml(s.id || s.file || 'skill');
+                    const file = escapeHtml(s.file || '');
+                    const pattern = escapeHtml((s.task_pattern || 'Без описания').slice(0, 85));
+                    return `
+                        <div class="task-item" onclick="loadSkillDetail('${file}')">
+                            🧠 <strong>${id}</strong>
+                            <span class="item-meta">${pattern}</span>
+                        </div>
+                    `;
+                }).join('');
+            } catch (e) {
+                console.error("Ошибка загрузки навыков:", e);
+            }
+        }
+        async function loadMemory() {
+            try {
+                const res = await fetch('/api/memory');
+                cachedMemory = await res.json();
+                const listEl = document.getElementById("sidebarList");
+                if (!cachedMemory || cachedMemory.length === 0) {
+                    listEl.innerHTML = "<p style='color: #64748b; font-size: 13px;'>Векторная память пуста</p>";
+                    return;
+                }
+                listEl.innerHTML = cachedMemory.map((m, idx) => {
+                    const taskTitle = escapeHtml((m.task || 'Без названия').slice(0, 80));
+                    const badge = m.skill_file ? ` | 🔗 ${escapeHtml(m.skill_file)}` : '';
+                    return `
+                        <div class="task-item" onclick="showMemoryDetail(${idx})">
+                            🗄 ${taskTitle}
+                            <span class="item-meta">${escapeHtml(m.timestamp || '')}${badge}</span>
+                        </div>
+                    `;
+                }).join('');
+            } catch (e) {
+                console.error("Ошибка загрузки памяти:", e);
+            }
+        }
+
         async function loadTaskResult(filename) {
             if (eventSource) eventSource.close();
+            document.getElementById("viewerTitle").textContent = `Просмотр задачи: ${filename}`;
             const res = await fetch(`/api/task/${filename}`);
             const data = await res.json();
             const logEl = document.getElementById("logOutput");
             logEl.textContent = data.content || data.error || "Пустой файл";
+            logEl.scrollTop = 0;
+        }
+
+        async function loadSkillDetail(filename) {
+            if (!filename) return;
+            if (eventSource) eventSource.close();
+            document.getElementById("viewerTitle").textContent = `Навык: ${filename}`;
+            const res = await fetch(`/api/skill/${filename}`);
+            const data = await res.json();
+            const logEl = document.getElementById("logOutput");
+            if (data.error) {
+                logEl.textContent = data.error;
+                return;
+            }
+            const cmds = (data.commands || []).map((c, i) => `${i + 1}. ${c}`).join('\n');
+            logEl.textContent =
+                `ID навыка: ${data.id || filename}\n` +
+                `Создан: ${data.created_at || '-'}\n` +
+                `Паттерн задачи: ${data.task_pattern || '-'}\n\n` +
+                `=== Проверенные команды ===\n${cmds || 'Нет команд'}\n\n` +
+                `=== Резюме решения ===\n${data.summary || '-'}`;
+            logEl.scrollTop = 0;
+        }
+
+        function showMemoryDetail(index) {
+            const item = cachedMemory[index];
+            if (!item) return;
+            if (eventSource) eventSource.close();
+            document.getElementById("viewerTitle").textContent = `Запись памяти (${item.timestamp || '-'})`;
+            const logEl = document.getElementById("logOutput");
+            logEl.textContent =
+                `Задача: ${item.task || '-'}\n` +
+                `Дата: ${item.timestamp || '-'}\n` +
+                `Вектор (embedding): ${item.has_embedding ? 'Да' : 'Нет'}\n` +
+                `Связанный навык: ${item.skill_file || 'Нет'}\n\n` +
+                `=== Сохранённое решение ===\n${item.solution || '-'}`;
             logEl.scrollTop = 0;
         }
 
@@ -254,7 +398,7 @@
                 setRunningState(data.running);
                 if (!data.running) {
                     eventSource.close();
-                    loadHistory();
+                    refreshSidebar();
                 }
             };
 
@@ -271,6 +415,7 @@
                 return;
             }
             setRunningState(true);
+            document.getElementById("viewerTitle").textContent = "Лог выполнения в реальном времени (SSE):";
             document.getElementById("logOutput").textContent = "Отправка задачи...";
 
             const res = await fetch('/api/run', {
@@ -292,11 +437,9 @@
 
         window.onload = async function() {
             await loadConfig();
-            await loadHistory();
+            await refreshSidebar();
             connectSSE();
         };
     </script>
 </body>
 </html>
-
-

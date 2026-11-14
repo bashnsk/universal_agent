@@ -15,7 +15,6 @@ class AgentMemory:
         base_url: str = "http://localhost:11434",
         embed_model: str = "nomic-embed-text:latest",
     ):
-        # Если из старого конфига передан путь к registry.json, разделяем память и skills
         passed_path = Path(storage_path)
         if passed_path.name == "registry.json":
             self.memory_path = Path("/home/sid/RAID/_AI/universal_agent/storage/memory/vector_memory.json")
@@ -95,7 +94,7 @@ class AgentMemory:
         except Exception:
             return None
 
-    async def search(self, query: str, top_k: int = 2, min_score: float = 0.68) -> str:
+    async def search(self, query: str, top_k: int = 3, min_score: float = 0.65) -> str:
         if not self.records:
             return ""
 
@@ -122,50 +121,71 @@ class AgentMemory:
 
         blocks = []
         for score, rec in top_items:
-            skill_hint = ""
-            if rec.get("skill_file"):
-                skill_hint = f"\nСохранённый навык: {rec['skill_file']}"
-            blocks.append(
-                f"[Сходство {score:.2f}] Прошлая задача: {rec['task']}\n"
-                f"Успешное решение:\n{rec['solution'][:1500]}{skill_hint}"
-            )
+            is_success = rec.get("is_success", True)
+            if not is_success:
+                bad_cmds = rec.get("failed_commands") or []
+                cmds_str = f"\nЗабракованные команды/URL: {', '.join(bad_cmds[:5])}" if bad_cmds else ""
+                blocks.append(
+                    f"[Сходство {score:.2f}] ⛔ АНТИ-ПАТТЕРН (ЭТИМ ПУТЁМ ИДТИ НЕ НАДО!):\n"
+                    f"Задача: {rec['task']}\n"
+                    f"Причина провала: {rec.get('failure_reason', 'Не получены фактические данные')}{cmds_str}\n"
+                    f"ИНСТРУКЦИЯ: Категорически запрещено повторять этот подход. Ищи принципиально другой источник или домен."
+                )
+            else:
+                skill_hint = ""
+                if rec.get("skill_file"):
+                    skill_hint = f"\nСохранённый навык: {rec['skill_file']}"
+                blocks.append(
+                    f"[Сходство {score:.2f}] ✅ ПРОВЕРЕННОЕ УСПЕШНОЕ РЕШЕНИЕ:\n"
+                    f"Задача: {rec['task']}\n"
+                    f"Результат:\n{rec['solution'][:1500]}{skill_hint}"
+                )
         return "\n---\n".join(blocks)
 
-    async def save(self, task: str, solution: str, executed_commands: Optional[List[str]] = None) -> None:
+    async def save(
+        self,
+        task: str,
+        solution: str,
+        executed_commands: Optional[List[str]] = None,
+        is_success: bool = True,
+        failure_reason: str = "",
+    ) -> None:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         embedding = await self._get_embedding(task)
+        unique_cmds = list(dict.fromkeys(c.strip() for c in (executed_commands or []) if c.strip()))
 
         skill_filename = ""
-        if executed_commands:
-            unique_cmds = list(dict.fromkeys(c.strip() for c in executed_commands if c.strip()))
-            if unique_cmds:
-                skill_filename = f"skill_{timestamp}.json"
-                skill_data = {
-                    "id": f"skill_{timestamp}",
-                    "created_at": datetime.now().isoformat(),
+        if is_success and unique_cmds:
+            skill_filename = f"skill_{timestamp}.json"
+            skill_data = {
+                "id": f"skill_{timestamp}",
+                "created_at": datetime.now().isoformat(),
+                "task_pattern": task,
+                "commands": unique_cmds,
+                "summary": solution[:1000],
+            }
+            (self.skills_dir / skill_filename).write_text(
+                json.dumps(skill_data, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            self.skills_registry.append(
+                {
+                    "id": skill_data["id"],
+                    "file": skill_filename,
                     "task_pattern": task,
-                    "commands": unique_cmds,
-                    "summary": solution[:1000],
+                    "commands": unique_cmds[:5],
+                    "created_at": skill_data["created_at"],
                 }
-                (self.skills_dir / skill_filename).write_text(
-                    json.dumps(skill_data, ensure_ascii=False, indent=2),
-                    encoding="utf-8",
-                )
-                self.skills_registry.append(
-                    {
-                        "id": skill_data["id"],
-                        "file": skill_filename,
-                        "task_pattern": task,
-                        "commands": unique_cmds[:5],
-                        "created_at": skill_data["created_at"],
-                    }
-                )
-                self._save_registry_file()
+            )
+            self._save_registry_file()
 
-        record = {
+        record: Dict[str, Any] = {
             "timestamp": timestamp,
             "task": task,
-            "solution": solution,
+            "is_success": is_success,
+            "solution": solution if is_success else "",
+            "failure_reason": "" if is_success else (failure_reason or "Отклонено критиком: нет фактических данных"),
+            "failed_commands": [] if is_success else unique_cmds[:8],
             "skill_file": skill_filename,
             "embedding": embedding or [],
         }
