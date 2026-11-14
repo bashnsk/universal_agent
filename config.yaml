@@ -1,28 +1,29 @@
-ollama:
-  base_url: "http://localhost:11434"
-  default_model: "qwen2.5-coder:14b"
-  critic_model: "deepseek-r1:14b"
-  embed_model: "nomic-embed-text:latest"
-  timeout: 300
-  max_concurrent_requests: 4
-  keep_alive: "10m"
-
 execution:
+  context_window: 8192
   max_iterations: 5
   multi_role_count: 3
-  context_window: 8192
   roles:
-    - name: "Senior_Developer"
-      temperature: 0.2
-      system_prompt: "Ты ведущий разработчик. Пиши чистый, рабочий код без заглушек. Учитывай крайние случаи."
-    - name: "System_Architect"
-      temperature: 0.3
-      system_prompt: "Ты системный архитектор Linux/DevOps. Оценивай надёжность, права доступа, пути и зависимости."
-    - name: "EdgeCase_Tester"
-      temperature: 0.4
-      system_prompt: "Ты инженер по тестированию и безопасности. Ищи уязвимости, ошибки парсинга и сбои окружения."
-
+  - name: Senior_Developer
+    system_prompt: Ты ведущий разработчик. Пиши чистый, рабочий код без заглушек.
+      Учитывай крайние случаи.
+    temperature: 0.2
+  - name: System_Architect
+    system_prompt: Ты системный архитектор Linux/DevOps. Оценивай надёжность, права
+      доступа, пути и зависимости.
+    temperature: 0.3
+  - name: EdgeCase_Tester
+    system_prompt: Ты инженер по тестированию и безопасности. Ищи уязвимости, ошибки
+      парсинга и сбои окружения.
+    temperature: 0.4
+ollama:
+  base_url: http://localhost:11434
+  critic_model: deepseek-r1:14b
+  default_model: qwen2.5-coder:14b
+  embed_model: nomic-embed-text:latest
+  keep_alive: 10m
+  max_concurrent_requests: 4
+  timeout: 300
 paths:
-  workspace_root: "/home/sid/RAID/_AI/universal_agent/storage/workspace"
-  tasks_archive: "/home/sid/RAID/_AI/universal_agent/storage/tasks"
-  skills_registry: "/home/sid/RAID/_AI/universal_agent/skills/registry.json"
+  skills_registry: /home/sid/RAID/_AI/universal_agent/skills/registry.json
+  tasks_archive: /home/sid/RAID/_AI/universal_agent/storage/tasks
+  workspace_root: /home/sid/RAID/_AI/universal_agent/storage/workspace

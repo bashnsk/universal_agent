@@ -146,7 +146,7 @@ class BatchOrchestrator:
             return False, "ненулевой код возврата или ошибка выполнения"
         if "[STDOUT]:" not in shell_out:
             return False, "пустой вывод (нет данных)"
-        stdout_part = shell_out.split("[STDOUT]:", 1)[1].strip()
+        stdout_part = shell_out.split("[STDOUT]:", 1).strip()
         if len(stdout_part) < 15:
             return False, "слишком короткий или пустой ответ"
         return True, ""
@@ -189,7 +189,6 @@ class BatchOrchestrator:
 
                 self._check_cancelled()
                 cmd = bash_match.group(1).strip()
-                self.all_attempted_commands.append(cmd)
                 print(f"  [Shell #{job.subtask_id}:{job.role_name}] Шаг {step}: {cmd[:90]}...")
                 shell_out = await ShellTool.run(
                     cmd,
