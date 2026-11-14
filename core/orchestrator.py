@@ -146,7 +146,7 @@ class BatchOrchestrator:
             return False, "ненулевой код возврата или ошибка выполнения"
         if "[STDOUT]:" not in shell_out:
             return False, "пустой вывод (нет данных)"
-        stdout_part = shell_out.split("[STDOUT]:", 1).strip()
+        stdout_part = shell_out.split("[STDOUT]:", 1)[1].strip()
         if len(stdout_part) < 15:
             return False, "слишком короткий или пустой ответ"
         return True, ""
@@ -159,10 +159,10 @@ class BatchOrchestrator:
             tool_instruction = (
                 "У тебя есть доступ к bash-песочнице Linux и готовым Python-инструментам:\n"
                 "- Поиск ссылок в интернете: python3 /home/sid/RAID/_AI/universal_agent/skills/web_search.py \"запрос\" --limit 5\n"
-                "- Парсинг любой страницы (BeautifulSoup): python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"https://url\"\n\n"
+                "- Парсинг одной страницы (BeautifulSoup): python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"https://реальный_url\"\n\n"
                 "УНИВЕРСАЛЬНЫЕ ПРАВИЛА:\n"
-                "1. Для поиска в сети ВСЕГДА используй web_search.py, а для чтения страниц — web_parser.py. "
-                "ЗАПРЕЩЕНО делать прямой curl к ://google.com и выдумывать URL-заглушки.\n"
+                "1. Для поиска в сети ВСЕГДА используй web_search.py, а для чтения страницы — передай ОДИН конкретный реальный URL в web_parser.py. "
+                "ЗАПРЕЩЕНО делать прямой curl к ://google.com и использовать шаблоны вроде <URL1>.\n"
                 "2. Никогда не повторяй команды из блока 'НЕУДАЧНЫЕ ПОПЫТКИ ТЕКУЩЕЙ ЗАДАЧИ'.\n"
                 "3. Для запуска команды выведи строго <bash>команда</bash> без лишнего текста. "
                 "Когда реальные факты получены — дай чёткий итоговый ответ."
@@ -206,7 +206,7 @@ class BatchOrchestrator:
                 followup_prompt = (
                     f"Выполнена команда:\n{cmd}\n\n"
                     f"Вывод песочницы:\n{shell_out}\n\n"
-                    f"Если получены ссылки через web_search.py — передай нужный реальный URL в web_parser.py через <bash>...</bash>. "
+                    f"Если получены ссылки через web_search.py — передай ОДИН лучший реальный URL в web_parser.py через <bash>...</bash>. "
                     f"Если факты уже получены — дай точный итоговый ответ по подзадаче: {job.description}"
                 )
                 response = await self.client.generate(
