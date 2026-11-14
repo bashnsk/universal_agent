@@ -1,24 +1,12 @@
 import asyncio
-import re
-import shutil
-from datetime import datetime
-from dataclasses import dataclass
-from pathlib import Path
 from typing import List, Dict, Any
 from agents.base import OllamaClient
-from core.planner import TaskPlanner
+from core.blackboard import SessionBlackboard
 from core.critic import CriticAgent
 from core.memory import AgentMemory
-from tools.shell import ShellTool
-
-
-@dataclass
-class SubtaskJob:
-    subtask_id: int
-    description: str
-    role_name: str
-    system_prompt: str
-    temperature: float
+from core.planner import TaskPlanner
+from core.worker import SubtaskJob, SubtaskWorker
+from core.workspace import WorkspaceManager
 
 
 class BatchOrchestrator:
@@ -26,12 +14,6 @@ class BatchOrchestrator:
         self.cfg = config
         self._cancelled = False
         self._active_tasks: List[asyncio.Task] = []
-
-        # Оперативная память текущей сессии (Session Blackboard)
-        self.session_working_commands: List[str] = []
-        self.session_failed_attempts: List[str] = []
-        self.session_discovered_urls: List[str] = []
-        self.session_extracted_facts: List[str] = []
 
         ollama_cfg = config.get("ollama", {})
         exec_cfg = config.get("execution", {})
@@ -48,20 +30,16 @@ class BatchOrchestrator:
         self.max_iterations = int(exec_cfg.get("max_iterations", 5))
         self.multi_role_count = int(exec_cfg.get("multi_role_count", 3))
         self.context_window = int(exec_cfg.get("context_window", 8192))
-        self.max_workspace_sessions = int(exec_cfg.get("max_workspace_sessions", 15))
 
-        self.workspace_base = Path(
-            paths_cfg.get(
-                "workspace_root",
-                "/home/sid/RAID/_AI/universal_agent/storage/workspace",
-            )
+        workspace_root = paths_cfg.get(
+            "workspace_root",
+            "/home/sid/RAID/_AI/universal_agent/storage/workspace",
         )
-        self.workspace_base.mkdir(parents=True, exist_ok=True)
-        self._rotate_workspaces(keep_last=self.max_workspace_sessions)
-
-        session_id = datetime.now().strftime("session_%Y%m%d_%H%M%S")
-        self.workspace_dir = self.workspace_base / session_id
-        self.workspace_dir.mkdir(parents=True, exist_ok=True)
+        self.workspace = WorkspaceManager(
+            root_dir=workspace_root,
+            keep_last=int(exec_cfg.get("max_workspace_sessions", 15)),
+        )
+        self.blackboard = SessionBlackboard()
 
         default_roles = [
             {
@@ -91,197 +69,37 @@ class BatchOrchestrator:
         )
         self.planner = TaskPlanner(self.client, self.executor_model)
         self.critic = CriticAgent(self.client, self.critic_model)
-
-        memory_path = paths_cfg.get(
-            "memory_path",
-            "/home/sid/RAID/_AI/universal_agent/storage/memory/vector_memory.json",
-        )
-        skills_dir = paths_cfg.get(
-            "skills_dir",
-            "/home/sid/RAID/_AI/universal_agent/skills",
-        )
         self.memory = AgentMemory(
-            storage_path=memory_path,
-            skills_dir=skills_dir,
+            storage_path=paths_cfg.get(
+                "memory_path",
+                "/home/sid/RAID/_AI/universal_agent/storage/memory/vector_memory.json",
+            ),
+            skills_dir=paths_cfg.get(
+                "skills_dir",
+                "/home/sid/RAID/_AI/universal_agent/skills",
+            ),
             base_url=self.base_url,
             embed_model=self.embed_model,
         )
-        self.semaphore = asyncio.Semaphore(self.max_concurrent)
-    def _rotate_workspaces(self, keep_last: int = 15) -> None:
-        if keep_last < 1 or not self.workspace_base.exists():
-            return
-        sessions = sorted(
-            [
-                p for p in self.workspace_base.iterdir()
-                if p.is_dir() and p.name.startswith("session_")
-            ],
-            key=lambda p: p.name,
+        self.worker = SubtaskWorker(
+            client=self.client,
+            model=self.executor_model,
+            context_window=self.context_window,
+            workspace_dir=str(self.workspace.session_dir),
+            blackboard=self.blackboard,
+            semaphore=asyncio.Semaphore(self.max_concurrent),
+            cancel_checker=self._check_cancelled,
         )
-        excess = len(sessions) - keep_last
-        if excess > 0:
-            for old_dir in sessions[:excess]:
-                try:
-                    shutil.rmtree(old_dir, ignore_errors=True)
-                except Exception:
-                    pass
-            print(f"[Workspace] Ротация: удалено старых сессий: {excess}")
 
-    def cancel(self):
+    def cancel(self) -> None:
         self._cancelled = True
         for t in self._active_tasks:
             if not t.done():
                 t.cancel()
 
-    def _check_cancelled(self):
+    def _check_cancelled(self) -> None:
         if self._cancelled:
             raise asyncio.CancelledError("Задача отменена пользователем.")
-
-    def _normalize_bash_command(self, raw_cmd: str) -> str:
-        cmd = raw_cmd.strip().strip("`")
-        # Если агент написал просто URL без команды — автоматически передаём его в web_parser.py
-        if re.match(r"^['\"]?https?://\S+['\"]?$", cmd):
-            clean_url = cmd.strip("'\"")
-            return f'python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py "{clean_url}"'
-        return cmd
-
-    def _record_session_failure(self, cmd: str, reason: str) -> None:
-        short_cmd = cmd.strip().replace("\n", " ")[:120]
-        short_reason = reason.strip().replace("\n", " ")[:140]
-        entry = f"Команда `{short_cmd}` -> ОШИБКА: {short_reason}"
-        if entry not in self.session_failed_attempts:
-            self.session_failed_attempts.append(entry)
-
-    def _harvest_session_progress(self, cmd: str, shell_out: str) -> tuple[bool, str]:
-        if "[EXIT CODE]: 0" not in shell_out or "[STDOUT]:" not in shell_out:
-            return False, "ошибка выполнения или пустой вывод"
-
-        stdout_part = shell_out.split("[STDOUT]:", 1)[1].strip()
-        if len(stdout_part) < 25:
-            return False, "слишком короткий ответ"
-
-        lowered = stdout_part.lower()
-        if "страница не найдена" in lowered or "404 not found" in lowered or "результатов не найдено" in lowered:
-            return False, "страница 404 или пустой поиск"
-
-        # Сохраняем все найденные реальные URL в общую доску сессии
-        found_urls = re.findall(r"https?://[^\s\"'<>)\]]+", stdout_part)
-        for u in found_urls:
-            clean_u = u.rstrip(".,;:")
-            if clean_u not in self.session_discovered_urls and len(self.session_discovered_urls) < 35:
-                self.session_discovered_urls.append(clean_u)
-
-        # Если это результат работы web_parser.py — сохраняем выжимку фактов на доску сессии
-        if "web_parser.py" in cmd and "=== ТЕКСТОВЫЕ ДАННЫЕ ===" in stdout_part:
-            snippet = stdout_part[:1200]
-            if snippet not in self.session_extracted_facts and len(self.session_extracted_facts) < 6:
-                self.session_extracted_facts.append(snippet)
-
-        return True, ""
-
-    async def _run_single_job(self, job: SubtaskJob, context_hint: str) -> Dict[str, Any]:
-        async with self.semaphore:
-            self._check_cancelled()
-            print(f"[Queue -> GPU] Подзадача #{job.subtask_id} | Роль: {job.role_name}")
-
-            tool_instruction = (
-                "У тебя есть доступ к bash-песочнице Linux и готовым Python-инструментам:\n"
-                "- Поиск ссылок в интернете: python3 /home/sid/RAID/_AI/universal_agent/skills/web_search.py \"запрос\" --limit 5\n"
-                "- Парсинг одной страницы (BeautifulSoup): python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"https://реальный_url\"\n\n"
-                "УНИВЕРСАЛЬНЫЕ ПРАВИЛА:\n"
-                "1. Если в блоке 'УЖЕ НАЙДЕННЫЕ В ЭТОЙ СЕССИИ URL' уже есть подходящий сайт — НЕ ищи его заново через web_search.py, "
-                "сразу парси его или его внутренние разделы через web_parser.py!\n"
-                "2. Никогда не пиши в <bash> голый URL без команды — всегда пиши полный вызов python3 .../web_parser.py \"https://...\".\n"
-                "3. Никогда не повторяй команды и страницы 404 из блока 'НЕУДАЧНЫЕ ПОПЫТКИ ТЕКУЩЕЙ ЗАДАЧИ'.\n"
-                "4. Для запуска команды выведи строго <bash>команда</bash> без лишнего текста. "
-                "Когда реальные факты получены — дай чёткий итоговый ответ."
-            )
-
-            prompt = (
-                f"{tool_instruction}\n\n"
-                f"{context_hint}\n\n"
-                f"Твоя подзадача:\n{job.description}"
-            )
-
-            response = await self.client.generate(
-                model=self.executor_model,
-                prompt=prompt,
-                system_prompt=job.system_prompt,
-                temperature=job.temperature,
-                num_ctx=self.context_window,
-            )
-
-            for step in range(1, 4):
-                bash_match = re.search(r"<bash>(.*?)</bash>", response, re.DOTALL)
-                if not bash_match:
-                    break
-
-                self._check_cancelled()
-                cmd = self._normalize_bash_command(bash_match.group(1))
-                print(f"  [Shell #{job.subtask_id}:{job.role_name}] Шаг {step}: {cmd[:95]}...")
-                shell_out = await ShellTool.run(
-                    cmd,
-                    workspace_dir=str(self.workspace_dir),
-                    timeout=20.0,
-                )
-
-                is_ok, fail_reason = self._harvest_session_progress(cmd, shell_out)
-                if is_ok:
-                    if cmd not in self.session_working_commands:
-                        self.session_working_commands.append(cmd)
-                else:
-                    self._record_session_failure(cmd, fail_reason)
-
-                followup_prompt = (
-                    f"Выполнена команда:\n{cmd}\n\n"
-                    f"Вывод песочницы:\n{shell_out}\n\n"
-                    f"Если в выводе есть нужная внутренняя ссылка (раздел с данными/новинками/чартом) — "
-                    f"распарси её следующим шагом через <bash>python3 /home/sid/RAID/_AI/universal_agent/skills/web_parser.py \"URL\"</bash>. "
-                    f"Если конкретные данные уже извлечены — дай точный итоговый ответ по подзадаче: {job.description}"
-                )
-                response = await self.client.generate(
-                    model=self.executor_model,
-                    prompt=followup_prompt,
-                    system_prompt=job.system_prompt,
-                    temperature=job.temperature,
-                    num_ctx=self.context_window,
-                )
-
-            return {
-                "subtask_id": job.subtask_id,
-                "description": job.description,
-                "role": job.role_name,
-                "output": response,
-            }
-    def _build_session_context(self, memory_context: str, last_feedback: str) -> str:
-        sections = []
-        if memory_context.strip():
-            sections.append(f"=== ПРОВЕРЕННЫЙ ОПЫТ ИЗ БАЗЫ НАВЫКОВ ===\n{memory_context.strip()}")
-
-        if self.session_discovered_urls:
-            urls_list = "\n".join(f"- {u}" for u in self.session_discovered_urls[-25:])
-            sections.append(
-                "=== УЖЕ НАЙДЕННЫЕ В ЭТОЙ СЕССИИ РЕАЛЬНЫЕ URL (ПРОДОЛЖАЙ ПАРСИНГ С НИХ!) ===\n"
-                f"{urls_list}"
-            )
-
-        if self.session_extracted_facts:
-            facts_blob = "\n---\n".join(self.session_extracted_facts[-3:])
-            sections.append(
-                "=== УЖЕ ИЗВЛЕЧЁННЫЕ СО СТРАНИЦ ДАННЫЕ ТЕКУЩЕЙ СЕССИИ ===\n"
-                f"{facts_blob[:3000]}"
-            )
-
-        if self.session_failed_attempts:
-            failed_list = "\n".join(f"- ⛔ {f}" for f in self.session_failed_attempts[-15:])
-            sections.append(
-                "=== НЕУДАЧНЫЕ ПОПЫТКИ ТЕКУЩЕЙ ЗАДАЧИ (ПОВТОРЯТЬ ЗАПРЕЩЕНО!) ===\n"
-                f"{failed_list}"
-            )
-
-        if last_feedback.strip():
-            sections.append(f"=== ВЕРДИКТ КРИТИКА ПО ПРОШЛОЙ ИТЕРАЦИИ ===\n{last_feedback.strip()}")
-
-        return "\n\n".join(sections)
 
     async def _synthesize_results(self, main_task: str, results: List[Dict[str, Any]]) -> str:
         self._check_cancelled()
@@ -290,18 +108,18 @@ class BatchOrchestrator:
             for r in results
         )
         blackboard_facts = ""
-        if self.session_extracted_facts:
+        if self.blackboard.extracted_facts:
             blackboard_facts = (
                 "\n\n=== СЫРЫЕ ИЗВЛЕЧЁННЫЕ ДАННЫЕ С РЕАЛЬНЫХ СТРАНИЦ ===\n"
-                + "\n---\n".join(self.session_extracted_facts[-3:])[:3500]
+                + "\n---\n".join(self.blackboard.extracted_facts[-3:])[:3500]
             )
 
         prompt = (
             f"Главная задача пользователя: {main_task}\n\n"
             f"Отчёты агентов:\n{grouped}"
             f"{blackboard_facts}\n\n"
-            f"ЖЁСТКОЕ ТРЕБОВАНИЕ: Отбрось все неудачные попытки, ошибки 404 и советы 'сделайте сами'. "
-            f"Используя реальные данные из отчётов и извлечённых страниц, сформируй точный, полный фактический ответ."
+            f"ЖЁСТКОЕ ТРЕБОВАНИЕ: Отбрось все неудачные попытки, нерелевантные сайты и советы 'сделайте сами'. "
+            f"Используя реальные данные из отчётов и извлечённых страниц, сформируй точный фактический ответ."
         )
         return await self.client.generate(
             model=self.executor_model,
@@ -310,37 +128,29 @@ class BatchOrchestrator:
             temperature=0.1,
             num_ctx=self.context_window,
         )
-
-    async def _execute_iteration_pipeline(
-        self,
-        task_text: str,
-        iteration_label: str,
-        memory_context: str,
-        last_feedback: str,
-    ) -> str:
+    async def _run_iteration(self, task_text: str, label: str, memory_context: str, last_feedback: str) -> str:
         self._check_cancelled()
-        print(f"\n=== {iteration_label} | Фаза 1: Планирование ({self.executor_model}) ===")
+        print(f"\n=== {label} | Фаза 1: Планирование ({self.executor_model}) ===")
 
-        full_context = self._build_session_context(memory_context, last_feedback)
+        full_context = self.blackboard.build_prompt_context(memory_context, last_feedback)
         subtasks = await self.planner.decompose(task_text, context=full_context)
         print(f"[+] Сформировано подзадач: {len(subtasks)}")
 
-        job_queue: List[SubtaskJob] = []
-        for idx, sub in enumerate(subtasks, start=1):
-            for role in self.active_roles:
-                job_queue.append(
-                    SubtaskJob(
-                        subtask_id=idx,
-                        description=sub,
-                        role_name=role["name"],
-                        system_prompt=role["system_prompt"],
-                        temperature=role["temperature"],
-                    )
-                )
+        job_queue = [
+            SubtaskJob(
+                subtask_id=idx,
+                description=sub,
+                role_name=role["name"],
+                system_prompt=role["system_prompt"],
+                temperature=role["temperature"],
+            )
+            for idx, sub in enumerate(subtasks, start=1)
+            for role in self.active_roles
+        ]
 
         print(f"=== Фаза 2: Очередь из {len(job_queue)} сессий на модели {self.executor_model} ===")
         self._active_tasks = [
-            asyncio.create_task(self._run_single_job(job, full_context))
+            asyncio.create_task(self.worker.execute(job, full_context))
             for job in job_queue
         ]
         raw_results = await asyncio.gather(*self._active_tasks)
@@ -348,17 +158,14 @@ class BatchOrchestrator:
 
         print(f"=== Фаза 3: Синтез результатов на модели {self.executor_model} ===")
         return await self._synthesize_results(task_text, raw_results)
+
     async def run(self, task_text: str) -> str:
         last_feedback = ""
         synthesized_solution = ""
         fast_verified = False
 
-        # Сброс оперативной доски текущей задачи
-        self.session_working_commands = []
-        self.session_failed_attempts = []
-        self.session_discovered_urls = []
-        self.session_extracted_facts = []
-        print(f"[Workspace] Изолированная папка сессии: {self.workspace_dir}")
+        self.blackboard.clear()
+        print(f"[Workspace] Изолированная папка сессии: {self.workspace.session_dir}")
 
         memory_context = ""
         try:
@@ -370,9 +177,9 @@ class BatchOrchestrator:
             print(f"[Memory WARN] Поиск в памяти пропущен: {e}")
 
         for iteration in range(1, self.max_iterations + 1):
-            synthesized_solution = await self._execute_iteration_pipeline(
+            synthesized_solution = await self._run_iteration(
                 task_text=task_text,
-                iteration_label=f"Итерация {iteration}/{self.max_iterations}",
+                label=f"Итерация {iteration}/{self.max_iterations}",
                 memory_context=memory_context,
                 last_feedback=last_feedback,
             )
@@ -384,83 +191,62 @@ class BatchOrchestrator:
                 model_override=self.executor_model,
             )
 
-            status = str(verdict.get("status", "RETRY")).upper()
-            critique_feedback = str(verdict.get("feedback", "Не получены фактические данные.")).strip()
-            dead_end = str(verdict.get("dead_end", "")).strip()
-            next_strategy = str(verdict.get("next_strategy", "")).strip()
-
-            if status == "SUCCESS":
-                print(f"[FAST-PASS] Предварительная проверка пройдена: {critique_feedback}")
+            if str(verdict.get("status", "RETRY")).upper() == "SUCCESS":
+                print(f"[FAST-PASS] Предварительная проверка пройдена: {verdict.get('feedback', '')}")
                 fast_verified = True
                 break
 
-            if dead_end:
-                self._record_session_failure(f"Подход итерации {iteration}", dead_end)
+            last_feedback = self.blackboard.apply_critic_rejection(verdict, iteration)
+            print(f"[RETRY] Критик отклонил ответ: {verdict.get('feedback', '')}")
 
-            last_feedback = (
-                f"Причина отклонения (итерация {iteration}): {critique_feedback}\n"
-                f"Тупиковый путь: {dead_end or 'не указан'}\n"
-                f"Что сделать по-другому: {next_strategy or 'распарсить внутренние разделы найденных URL'}"
-            ).strip()
-            print(f"[RETRY] Критик отклонил ответ: {critique_feedback}")
-            if next_strategy:
-                print(f"[SEARCH ALT] Новый вектор поиска: {next_strategy}")
-
-        if fast_verified:
+        if fast_verified and self.critic_model and self.critic_model != self.executor_model:
             self._check_cancelled()
-            if self.critic_model and self.critic_model != self.executor_model:
-                print(f"\n=== Фаза 4.2: Финальный глубокий аудит ({self.critic_model}) ===")
-                final_verdict = await self.critic.evaluate(
+            print(f"\n=== Фаза 4.2: Финальный глубокий аудит ({self.critic_model}) ===")
+            final_verdict = await self.critic.evaluate(
+                task_text,
+                synthesized_solution,
+                model_override=self.critic_model,
+            )
+
+            if str(final_verdict.get("status", "RETRY")).upper() != "SUCCESS":
+                final_feedback = str(final_verdict.get("feedback", "")).strip()
+                print(f"[FINAL-CRITIC REJECT] Глубокий аудит выявил недочёт: {final_feedback}")
+                last_feedback = self.blackboard.apply_critic_rejection(final_verdict, self.max_iterations + 1)
+
+                synthesized_solution = await self._run_iteration(
+                    task_text=task_text,
+                    label="Финальная доработка после глубокого аудита",
+                    memory_context=memory_context,
+                    last_feedback=last_feedback,
+                )
+                recheck = await self.critic.evaluate(
                     task_text,
                     synthesized_solution,
-                    model_override=self.critic_model,
+                    model_override=self.executor_model,
                 )
-                final_status = str(final_verdict.get("status", "RETRY")).upper()
-                final_feedback = str(final_verdict.get("feedback", "")).strip()
-
-                if final_status != "SUCCESS":
-                    print(f"[FINAL-CRITIC REJECT] Глубокий аудит выявил недочёт: {final_feedback}")
-                    dead_end = str(final_verdict.get("dead_end", "")).strip() or final_feedback
-                    self._record_session_failure("Финальный аудит", dead_end)
-
-                    synthesized_solution = await self._execute_iteration_pipeline(
-                        task_text=task_text,
-                        iteration_label="Финальная доработка после глубокого аудита",
-                        memory_context=memory_context,
-                        last_feedback=f"Замечания финального аудитора: {final_feedback}",
-                    )
-                    recheck = await self.critic.evaluate(
-                        task_text,
-                        synthesized_solution,
-                        model_override=self.executor_model,
-                    )
-                    if str(recheck.get("status", "RETRY")).upper() != "SUCCESS":
-                        fast_verified = False
-                else:
-                    print(f"[SUCCESS] Финальный аудитор утвердил решение: {final_feedback}")
+                if str(recheck.get("status", "RETRY")).upper() != "SUCCESS":
+                    fast_verified = False
+            else:
+                print(f"[SUCCESS] Финальный аудитор утвердил решение: {final_verdict.get('feedback', '')}")
 
         if fast_verified:
             try:
                 await self.memory.save(
                     task_text,
                     synthesized_solution,
-                    executed_commands=self.session_working_commands,
+                    executed_commands=self.blackboard.working_commands,
                     is_success=True,
                 )
                 print("[Memory] Победившее решение и рабочие инструменты сохранены в базу навыков.")
             except Exception as e:
                 print(f"[Memory WARN] Не удалось сохранить опыт: {e}")
 
-            self.session_failed_attempts.clear()
-            self.session_discovered_urls.clear()
-            self.session_extracted_facts.clear()
+            self.blackboard.clear()
             return synthesized_solution
 
         print("[FAILED] Задача не решена. Временный буфер сессии очищен, постоянная память не засорена.")
-        failed_summary = "\n".join(f"- ⛔ {item}" for item in self.session_failed_attempts[-8:])
-        self.session_failed_attempts.clear()
-        self.session_discovered_urls.clear()
-        self.session_extracted_facts.clear()
+        failed_summary = "\n".join(f"- ⛔ {item}" for item in self.blackboard.failed_attempts[-8:])
+        self.blackboard.clear()
 
         return (
             f"## Статус: Задача не выполнена за {self.max_iterations} итераций\n\n"
@@ -470,4 +256,3 @@ class BatchOrchestrator:
 
 
 Orchestrator = BatchOrchestrator
-
